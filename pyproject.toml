@@ -1,0 +1,87 @@
+[tool.black]
+line-length = 240
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Same import package as the upstream `qvic` distribution, plus qvic.train.
+# The local version segment marks the training overlay; install one or the
+# other, not both.
+name = "qvic"
+version = "1.0.0+train.1"
+description = "Unofficial reconstruction of the training code for QViC-MF (CVPR 2026)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "CC-BY-NC-SA-4.0" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: Other/Proprietary License",
+]
+
+[project.optional-dependencies]
+# Inherited from the upstream release: what the model code itself needs.
+eval = [
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "transformers @ git+https://github.com/huggingface/transformers.git@1c39974a4c4036fd641bc1191cc32799f85715a4",
+    "tokenizers~=0.15.2",
+    "accelerate==0.29.3",
+    "peft==0.10.0",
+    "numpy==1.26.4",
+    "Pillow",
+    "decord",
+    "av",
+    "opencv-python",
+    "einops",
+    "einops-exts==0.0.4",
+    "sentencepiece~=0.1.99",
+    "timm",
+    "open_clip_torch",
+    "huggingface-hub",
+    "hf_transfer",
+    "tqdm",
+    "loguru",
+    "shortuuid",
+    "ftfy",
+    "openai",
+    # scipy<1.15: qvic/model/qvic_meta_mixin.py imports scipy.ndimage.filters,
+    # removed in 1.15. Upstream leaves this unbounded.
+    "scipy<1.15",
+    "matplotlib",
+    "datasets==2.16.1",
+    "pyarrow",
+]
+
+# Everything above, plus what training adds.
+train = [
+    "qvic[eval]",
+    # 0.14.4 dropped UtilsBuilder, so nothing on the bf16 ZeRO-2/3 path needs a
+    # JIT-compiled extension at run time.
+    "deepspeed==0.14.4",
+    "ninja",
+    "pandas",
+]
+
+# Optional: metric reporting for long runs.
+wandb = ["wandb"]
+
+[project.urls]
+"Homepage" = "https://github.com/dumbgoos/QVIC-MF-Train"
+"Upstream" = "https://github.com/FujitsuResearch/QViC-MF"
+"Paper" = "https://arxiv.org/abs/2603.15167"
+
+[tool.setuptools.packages.find]
+include = ["qvic*"]
+exclude = [
+    "assets*",
+    "ckpt*",
+    "docs",
+    "dist*",
+    "logs*",
+    "scripts*",
+    "tests*",
+    "wandb*",
+    "work_dirs*",
+]

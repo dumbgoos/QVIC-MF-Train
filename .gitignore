@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+env/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Run artefacts
+ckpt/
+logs/
+work_dirs/
+wandb/
+runs/
+*.log
+
+# Data
+data/
+*.tar
+*.tar.gz
+*.parquet
+*.mp4
+
+# Crash dumps / editors / OS
+core.*
+*.swp
+.idea/
+.vscode/
+.DS_Store
