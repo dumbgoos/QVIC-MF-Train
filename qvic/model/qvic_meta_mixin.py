@@ -44,6 +44,9 @@ from scipy.ndimage.filters import gaussian_filter
 from qvic.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
 from qvic.utils import rank0_print, rank_print
 
+# #@HTM
+from qvic.model.htm import HTMMemoryController, HTMPredictor
+
 
 class QViCMetaMixin:
     """Mixin providing QViC's question-guided context encoding and memory bank.
@@ -102,9 +105,44 @@ class QViCMetaMixin:
         self.pad_token_id = 151643  # Qwen2; updated in initialize_vision_tokenizer()
         self.verbose = False
 
+        # #@HTM — Hierarchical Temporal Memory (write/consolidation path)
+        self.use_htm = False
+        self.htm_stage_a = False
+        self.htm_predictor = None  # set via initialize_htm()
+        self.htm_controller = None
+        self.htm_pred_loss = None
+        self.htm_recent_window = 4
+        self.htm_pred_weight = 1.0
+        self.htm_lambda_lm = 0.0  # Stage A: optimize L_pred only by default
+
     @abstractmethod
     def get_encoder(self):
         pass
+
+    # #@HTM
+    def initialize_htm(self, hidden_size=None, recent_window_W=4, quantile=0.75):
+        """Attach GRU predictor + online memory controller (Stage A write path)."""
+        dim = self.get_model().config.hidden_size
+        self.htm_predictor = HTMPredictor(dim=dim, hidden_size=hidden_size)
+        L = self.context_memory_length or getattr(self.config, "context_memory_length", 256)
+        self.htm_recent_window = int(recent_window_W)
+        self.htm_controller = HTMMemoryController(
+            token_budget_L=L,
+            recent_window_W=self.htm_recent_window,
+            quantile=quantile,
+        )
+        self.use_htm = True
+        rank0_print(f"[HTM] initialized predictor dim={dim}, L={L}, W={self.htm_recent_window}")
+
+    # #@HTM
+    def set_use_htm(self, use_htm):
+        self.use_htm = bool(use_htm)
+        rank0_print(f"[HTM] use_htm: {self.use_htm} (updated)")
+
+    # #@HTM
+    def set_htm_stage_a(self, htm_stage_a):
+        self.htm_stage_a = bool(htm_stage_a)
+        rank0_print(f"[HTM] htm_stage_a: {self.htm_stage_a} (updated)")
 
     # ------------------------------------------------------------------
     # Configuration / setters
@@ -716,13 +754,25 @@ class QViCMetaMixin:
                     )
 
                     # paper: eq.(3)
-                    encoder_outputs = self.forward_encoder(
-                        inputs_embeds_,
-                        attention_mask_encoder,
-                        token_ranges if self.question_guided_selective_attention or self.ctx_attn_mask_type == "single_frame" else None,
-                        output_attentions=self.compress_with_relevance,
-                    )
-                    context_embeds = self.get_context_embeds_from_encoder_outputs(encoder_outputs, token_ranges=token_ranges)  # [B, T, ctx, D]
+                    # #@HTM — Stage A freezes compressor: encode under no_grad
+                    _htm_freeze_enc = getattr(self, "use_htm", False) and getattr(self, "htm_stage_a", False)
+                    if _htm_freeze_enc:
+                        with torch.no_grad():
+                            encoder_outputs = self.forward_encoder(
+                                inputs_embeds_,
+                                attention_mask_encoder,
+                                token_ranges if self.question_guided_selective_attention or self.ctx_attn_mask_type == "single_frame" else None,
+                                output_attentions=self.compress_with_relevance,
+                            )
+                            context_embeds = self.get_context_embeds_from_encoder_outputs(encoder_outputs, token_ranges=token_ranges)  # [B, T, ctx, D]
+                    else:
+                        encoder_outputs = self.forward_encoder(
+                            inputs_embeds_,
+                            attention_mask_encoder,
+                            token_ranges if self.question_guided_selective_attention or self.ctx_attn_mask_type == "single_frame" else None,
+                            output_attentions=self.compress_with_relevance,
+                        )
+                        context_embeds = self.get_context_embeds_from_encoder_outputs(encoder_outputs, token_ranges=token_ranges)  # [B, T, ctx, D]
 
                     if self.ctx_attn_mask_type == "single_frame":
                         # [T_clip, B=1, ctx, D] -> [B=1, T_clip, ctx, D]
@@ -805,53 +855,88 @@ class QViCMetaMixin:
 
                     # Write to shared memory, need an I/O lock
                     # Context memory bank generation
-                    for i_frame in range(context_embeds.shape[1]):
-                        B, _, _, _ = context_embeds.shape
-                        context_embed = context_embeds[:, i_frame:i_frame + 1]  # [B, 1, ctx, D]
+                    # #@HTM — prediction-driven write/consolidation replaces MF append+merge when enabled
+                    if getattr(self, "use_htm", False) and self.htm_predictor is not None and self.htm_controller is not None:
+                        if (not self.htm_controller.states) or (
+                            reset_memory and i_clip == 0 and self.context_memory is None
+                        ):
+                            self.htm_controller.reset(context_embeds.shape[0])
+                            self.htm_pred_loss = None
+                            self._htm_pred_loss_sum = None
+                            self._htm_pred_steps = 0
+                        # Stage A: compressor outputs are targets with stop-grad (design §4.3 / §7).
+                        ctx_for_htm = context_embeds.detach() if self.htm_stage_a else context_embeds
+                        for i_frame in range(ctx_for_htm.shape[1]):
+                            context_embed = ctx_for_htm[:, i_frame:i_frame + 1]  # [B, 1, C, D]
+                            step_loss = self.htm_controller.write_batch(
+                                context_embed,
+                                self.htm_predictor,
+                                collect_threshold_stats=bool(self.training),
+                            )
+                            if step_loss is not None:
+                                if getattr(self, "_htm_pred_loss_sum", None) is None:
+                                    self._htm_pred_loss_sum = step_loss
+                                    self._htm_pred_steps = 1
+                                else:
+                                    self._htm_pred_loss_sum = self._htm_pred_loss_sum + step_loss
+                                    self._htm_pred_steps = int(self._htm_pred_steps) + 1
+                        self.context_memory = self.htm_controller.materialize_context_memory(ctx_for_htm)
+                        # Keep compression_size aligned for any legacy callers (token units ≈ 1 each).
+                        B_h, T_h, _, _ = self.context_memory.shape
+                        self.compression_size = torch.ones(B_h, T_h, device=self.context_memory.device)
+                    else:
+                        for i_frame in range(context_embeds.shape[1]):
+                            B, _, _, _ = context_embeds.shape
+                            context_embed = context_embeds[:, i_frame:i_frame + 1]  # [B, 1, ctx, D]
 
-                        if self.compress_with_relevance:
-                            relevance = relevances_outputs[:, i_frame:i_frame + 1].to(self.device)  # [B, 1]
-                            frame_idx = torch.tensor([start_idx + i_frame], dtype=torch.float32, device=self.device).unsqueeze(0).expand(B, -1)  # [B, 1]
-
-                        size_constant = torch.ones(B, 1).to(context_embed.device)  # [B, 1]
-                        freq_constant = torch.zeros(B, 1).to(context_embed.device)  # [B, 1]
-
-                        if self.context_memory is None:
-                            self.context_memory = context_embed  # [B, 1, ctx, D]
-                            self.compression_size = size_constant
                             if self.compress_with_relevance:
-                                self.relevance_memory = relevance
-                                self.frame_indices_memory = frame_idx
-                                self.reflection_frequency = freq_constant
-                                relevance_memory_long = relevance  # debug
-                        else:
-                            self.context_memory = torch.cat([self.context_memory, context_embed], dim=1)  # [B, t+1, N, D]
-                            self.compression_size = torch.cat([self.compression_size, size_constant], dim=1)  # [B, t+1]
+                                relevance = relevances_outputs[:, i_frame:i_frame + 1].to(self.device)  # [B, 1]
+                                frame_idx = torch.tensor([start_idx + i_frame], dtype=torch.float32, device=self.device).unsqueeze(0).expand(B, -1)  # [B, 1]
+
+                            size_constant = torch.ones(B, 1).to(context_embed.device)  # [B, 1]
+                            freq_constant = torch.zeros(B, 1).to(context_embed.device)  # [B, 1]
+
+                            if self.context_memory is None:
+                                self.context_memory = context_embed  # [B, 1, ctx, D]
+                                self.compression_size = size_constant
+                                if self.compress_with_relevance:
+                                    self.relevance_memory = relevance
+                                    self.frame_indices_memory = frame_idx
+                                    self.reflection_frequency = freq_constant
+                                    relevance_memory_long = relevance  # debug
+                            else:
+                                self.context_memory = torch.cat([self.context_memory, context_embed], dim=1)  # [B, t+1, N, D]
+                                self.compression_size = torch.cat([self.compression_size, size_constant], dim=1)  # [B, t+1]
+                                if self.compress_with_relevance:
+                                    self.relevance_memory = torch.cat([self.relevance_memory, relevance], dim=1)  # [B, t+1]
+                                    self.frame_indices_memory = torch.cat([self.frame_indices_memory, frame_idx], dim=1)  # [B, t+1]
+                                    self.reflection_frequency = torch.cat([self.reflection_frequency, freq_constant], dim=1)  # [B, t+1]
+                                    relevance_memory_long = torch.cat([relevance_memory_long, relevance], dim=1)  # debug # [B, t+1]
+
                             if self.compress_with_relevance:
-                                self.relevance_memory = torch.cat([self.relevance_memory, relevance], dim=1)  # [B, t+1]
-                                self.frame_indices_memory = torch.cat([self.frame_indices_memory, frame_idx], dim=1)  # [B, t+1]
-                                self.reflection_frequency = torch.cat([self.reflection_frequency, freq_constant], dim=1)  # [B, t+1]
-                                relevance_memory_long = torch.cat([relevance_memory_long, relevance], dim=1)  # debug # [B, t+1]
+                                B, L, N, D = self.context_memory.shape
+                                if L > 1:
+                                    # Calculate the similarity of the last adjacent frames, and remove the new frame if it exceeds the threshold
+                                    if L > self.context_memory_length:
+                                        # Remove the frame with the lowest relevance
+                                        index_min_relevance = torch.argmin(self.relevance_memory[0]).item()
+                                        self.remove_target_frame_on_memory(index_min_relevance)
 
-                        if self.compress_with_relevance:
-                            B, L, N, D = self.context_memory.shape
-                            if L > 1:
-                                # Calculate the similarity of the last adjacent frames, and remove the new frame if it exceeds the threshold
-                                if L > self.context_memory_length:
-                                    # Remove the frame with the lowest relevance
-                                    index_min_relevance = torch.argmin(self.relevance_memory[0]).item()
-                                    self.remove_target_frame_on_memory(index_min_relevance)
+                            elif self.context_memory.size(1) > self.context_memory_length:
+                                # Calculate the similarity of the adjacent frames in the context memory and average the adjacent frames with the highest similarity
+                                B, L, N, D = self.context_memory.shape
+                                similarity_matrix = F.cosine_similarity(
+                                    self.context_memory[:, :-1].view(B, L - 1, N * D).to(torch.float32),
+                                    self.context_memory[:, 1:].view(B, L - 1, N * D).to(torch.float32), dim=-1, eps=1e-8)
+                                similarity_max, index_max = torch.max(similarity_matrix[0], dim=0)
+                                self.merge_target_frame_on_memory(index_max, index_max + 1)
 
-                        elif self.context_memory.size(1) > self.context_memory_length:
-                            # Calculate the similarity of the adjacent frames in the context memory and average the adjacent frames with the highest similarity
-                            B, L, N, D = self.context_memory.shape
-                            similarity_matrix = F.cosine_similarity(
-                                self.context_memory[:, :-1].view(B, L - 1, N * D).to(torch.float32),
-                                self.context_memory[:, 1:].view(B, L - 1, N * D).to(torch.float32), dim=-1, eps=1e-8)
-                            similarity_max, index_max = torch.max(similarity_matrix[0], dim=0)
-                            self.merge_target_frame_on_memory(index_max, index_max + 1)
-
-                if self.context_memory.size(1) < self.context_memory_length and self.fill_context_memory:
+                # #@HTM — mean L_pred over predictor steps; skip MF fill (token-budget memory)
+                if getattr(self, "use_htm", False):
+                    steps = int(getattr(self, "_htm_pred_steps", 0) or 0)
+                    if getattr(self, "_htm_pred_loss_sum", None) is not None and steps > 0:
+                        self.htm_pred_loss = self._htm_pred_loss_sum / float(steps)
+                elif self.context_memory.size(1) < self.context_memory_length and self.fill_context_memory:
 
                     target_length = random.randint(self.context_memory.size(1), self.context_memory_length)
                     rank0_print(f"[INFO] randomly set target_length to {target_length}")
@@ -989,6 +1074,12 @@ class QViCMetaMixin:
             if delete_tensor:
                 del self.frame_indices_memory
             self.frame_indices_memory = None
+        # #@HTM
+        if getattr(self, "htm_controller", None) is not None:
+            self.htm_controller.states = []
+        self.htm_pred_loss = None
+        self._htm_pred_loss_sum = None
+        self._htm_pred_steps = 0
 
     def clear_memory(self, delete_tensor=True):
         if self.memory_for_each_batch is not None:

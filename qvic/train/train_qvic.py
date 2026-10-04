@@ -48,6 +48,21 @@ class ModelArguments:
     fill_context_memory: bool = field(
         default=True, metadata={"help": "Randomise the effective memory length in [K, L] during training."})
 
+    # #@HTM — Stage A: freeze compressor/VLM/LoRA, train GRU predictor write path
+    use_htm: bool = field(default=False, metadata={"help": "Enable HTM write/consolidation path."})
+    htm_stage_a: bool = field(
+        default=False,
+        metadata={"help": "HTM Stage A: train predictor only; freeze compressor/VLM/LoRA; K_r may stay 0."},
+    )
+    htm_recent_window: int = field(default=4, metadata={"help": "HTM recent-clip window W (raw C tokens each)."})
+    htm_hidden_size: int = field(
+        default=-1, metadata={"help": "GRU hidden size; <0 means use model hidden_size."},
+    )
+    htm_quantile: float = field(default=0.75, metadata={"help": "Adaptive τ_s/τ_d quantile."})
+    htm_lambda_lm: float = field(
+        default=0.0, metadata={"help": "Stage A weight on LM loss; 0 => L_pred only."},
+    )
+
     # --- attention kernels ---
     attn_implementation: str = field(default="sdpa", metadata={"help": "Decoder attention: sdpa | eager | flash_attention_2"})
     encoder_attn_implementation: str = field(
@@ -245,6 +260,26 @@ def build_model(model_args: ModelArguments, training_args: QViCTrainingArguments
     model.train_qvic_freeze_encoder = False
     model.verbose = False
 
+    # #@HTM
+    if model_args.use_htm or model_args.htm_stage_a:
+        hidden = None if model_args.htm_hidden_size < 0 else model_args.htm_hidden_size
+        model.initialize_htm(
+            hidden_size=hidden,
+            recent_window_W=model_args.htm_recent_window,
+            quantile=model_args.htm_quantile,
+        )
+        model.set_use_htm(True)
+        model.set_htm_stage_a(bool(model_args.htm_stage_a))
+        model.htm_lambda_lm = float(model_args.htm_lambda_lm)
+        model.htm_predictor.to(dtype=compute_dtype)
+        # Keep K_r off; write path stays on (design §2 / §7).
+        model.compress_with_relevance = False
+        if model_args.htm_stage_a:
+            model.fill_context_memory = False
+            model.train_qvic_freeze_encoder = False  # grads needed for GRU; compressor under no_grad inside
+        rank0("HTM enabled (stage_a=%s, W=%d, quantile=%.2f)",
+              model_args.htm_stage_a, model_args.htm_recent_window, model_args.htm_quantile)
+
     return model, compute_dtype
 
 
@@ -297,7 +332,15 @@ def summarise_trainables(model) -> None:
     rank0("trainable: %d / %d params (%.4f%%)", n_train, total, 100.0 * n_train / max(total, 1))
     groups = {}
     for name, numel in trainable:
-        key = "lora" if "lora_" in name else ("context_embed" if "context_embed" in name else "other")
+        # #@HTM
+        if "htm_predictor" in name:
+            key = "htm_predictor"
+        elif "lora_" in name:
+            key = "lora"
+        elif "context_embed" in name:
+            key = "context_embed"
+        else:
+            key = "other"
         groups[key] = groups.get(key, 0) + numel
     for key, numel in sorted(groups.items()):
         rank0("  %-14s %d", key, numel)
@@ -340,7 +383,21 @@ def train() -> None:
 
     # Freeze the world, then re-open exactly the two modules the paper trains.
     model.requires_grad_(False)
-    model = apply_lora(model, model_args)
+    # #@HTM Stage A: skip LoRA; train GRU predictor only (compressor/VLM/LoRA frozen).
+    if model_args.htm_stage_a:
+        base = model
+        if base.htm_predictor is None:
+            raise RuntimeError("htm_stage_a requires --use_htm / initialize_htm")
+        for p in base.htm_predictor.parameters():
+            p.requires_grad = True
+        rank0("HTM Stage A: trainable modules = htm_predictor only")
+    else:
+        model = apply_lora(model, model_args)
+        if model_args.use_htm:
+            base = model.get_base_model() if hasattr(model, "get_base_model") else model
+            if base.htm_predictor is not None:
+                for p in base.htm_predictor.parameters():
+                    p.requires_grad = True
     summarise_trainables(model)
 
     model.config.use_cache = False

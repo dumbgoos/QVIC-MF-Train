@@ -113,6 +113,18 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict
             )
+            # #@HTM — Stage A trains L_pred; LM path may stay frozen (K_r may be 0)
+            if getattr(self, "use_htm", False) and getattr(self, "htm_pred_loss", None) is not None:
+                pred = self.htm_pred_loss
+                if getattr(self, "htm_stage_a", False):
+                    lm_w = float(getattr(self, "htm_lambda_lm", 0.0))
+                    if outputs.loss is None or lm_w == 0.0:
+                        outputs.loss = pred
+                    else:
+                        outputs.loss = pred + lm_w * outputs.loss
+                else:
+                    w = float(getattr(self, "htm_pred_weight", 1.0))
+                    outputs.loss = (outputs.loss if outputs.loss is not None else 0.0) + w * pred
             return outputs
             
     @torch.no_grad()
