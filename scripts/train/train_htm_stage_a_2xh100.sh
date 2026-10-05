@@ -63,7 +63,8 @@ ANNOTATION_ROOT="${ANNOTATION_ROOT:-/mnt/sdb1/wenbin/luoling/LLaVA-Video-83K}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-$ANNOTATION_ROOT/annotations/all_sampled.json}"
 
 MODEL_BASE="${MODEL_BASE:-lmms-lab/LLaVA-Video-7B-Qwen2}"
-OUTPUT_DIR="${OUTPUT_DIR:-$QVIC_ROOT/checkpoints/htm_stage_a_2xh100}"
+# #@HTM — absolute server checkpoint default
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint}"
 # #@HTM — keep ZeRO-3 like train_qvic_83k.sh (full frozen 7B+7B still resident)
 DS_CONFIG="${DS_CONFIG:-$QVIC_ROOT/scripts/train/zero3.json}"
 RUN_NAME="${RUN_NAME:-$(basename "$OUTPUT_DIR")}"
