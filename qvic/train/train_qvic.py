@@ -58,9 +58,21 @@ class ModelArguments:
     htm_hidden_size: int = field(
         default=-1, metadata={"help": "GRU hidden size; <0 means use model hidden_size."},
     )
-    htm_quantile: float = field(default=0.75, metadata={"help": "Adaptive τ_s/τ_d quantile."})
+    # #@HTM — Stage A stats locked default quantile=0.9 (merge-rate / token↓ gate)
+    htm_quantile: float = field(default=0.9, metadata={"help": "Adaptive τ_s/τ_d quantile (locked default 0.9)."})
     htm_lambda_lm: float = field(
         default=0.0, metadata={"help": "Stage A weight on LM loss; 0 => L_pred only."},
+    )
+    # #@HTM — Stage B: L = L_LM + λ L_pred (compressor LoRA + predictor trainable)
+    htm_lambda: float = field(
+        default=0.1,
+        metadata={"help": "Stage B weight λ on L_pred in L = L_LM + λ L_pred."},
+    )
+    htm_init_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Stage A checkpoint dir (or non_lora_trainables.bin) to initialize HTM predictor."
+        },
     )
 
     # --- attention kernels ---
@@ -133,6 +145,44 @@ class QViCTrainingArguments(TrainingArguments):
 def rank0(msg: str, *args) -> None:
     if int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0))) == 0:
         logger.info(msg, *args)
+
+
+# #@HTM
+def load_htm_predictor_from_checkpoint(predictor, checkpoint: str) -> None:
+    """Load Stage A ``htm_predictor.*`` weights into an initialized GRU predictor."""
+    path = pathlib.Path(checkpoint)
+    bin_path = path / "non_lora_trainables.bin" if path.is_dir() else path
+    if not bin_path.is_file():
+        raise FileNotFoundError(f"HTM init checkpoint not found: {bin_path}")
+
+    raw = torch.load(str(bin_path), map_location="cpu")
+    if not isinstance(raw, dict):
+        raise ValueError(f"expected state-dict dict in {bin_path}")
+
+    cleaned = {}
+    for k, v in raw.items():
+        key = k
+        for prefix in (
+            "base_model.model.htm_predictor.",
+            "base_model.htm_predictor.",
+            "model.htm_predictor.",
+            "htm_predictor.",
+        ):
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                break
+        if key.startswith("gru.") or key.startswith("proj."):
+            cleaned[key] = v
+
+    if not cleaned:
+        raise KeyError(
+            f"no htm_predictor.* tensors in {bin_path}; keys sample={list(raw)[:12]}"
+        )
+    missing, unexpected = predictor.load_state_dict(cleaned, strict=False)
+    rank0(
+        "HTM: loaded %d predictor tensors from %s (missing=%s unexpected=%s)",
+        len(cleaned), bin_path, list(missing), list(unexpected),
+    )
 
 
 def install_zero3_param_guard(model) -> None:
@@ -271,14 +321,29 @@ def build_model(model_args: ModelArguments, training_args: QViCTrainingArguments
         model.set_use_htm(True)
         model.set_htm_stage_a(bool(model_args.htm_stage_a))
         model.htm_lambda_lm = float(model_args.htm_lambda_lm)
+        # #@HTM — Stage B joint loss: L = L_LM + λ L_pred
+        model.htm_pred_weight = float(model_args.htm_lambda)
         model.htm_predictor.to(dtype=compute_dtype)
-        # Keep K_r off; write path stays on (design §2 / §7).
+        # Keep K_r off in training (design §2 / §7; relevance read is inference-only).
+        # Write path stays on. Stage B does not enable K_r yet.
         model.compress_with_relevance = False
+        model.fill_context_memory = False  # HTM owns the token-budget memory
         if model_args.htm_stage_a:
-            model.fill_context_memory = False
             model.train_qvic_freeze_encoder = False  # grads needed for GRU; compressor under no_grad inside
-        rank0("HTM enabled (stage_a=%s, W=%d, quantile=%.2f)",
-              model_args.htm_stage_a, model_args.htm_recent_window, model_args.htm_quantile)
+        else:
+            # #@HTM Stage B: compressor LoRA gets grads through context embeds
+            model.train_qvic_freeze_encoder = False
+        if model_args.htm_init_checkpoint:
+            load_htm_predictor_from_checkpoint(
+                model.htm_predictor, model_args.htm_init_checkpoint)
+        rank0(
+            "HTM enabled (stage_a=%s, W=%d, quantile=%.2f, lambda=%.3f, init=%s)",
+            model_args.htm_stage_a,
+            model_args.htm_recent_window,
+            model_args.htm_quantile,
+            model_args.htm_lambda,
+            model_args.htm_init_checkpoint or "none",
+        )
 
     return model, compute_dtype
 
@@ -393,11 +458,18 @@ def train() -> None:
         rank0("HTM Stage A: trainable modules = htm_predictor only")
     else:
         model = apply_lora(model, model_args)
+        # #@HTM Stage B: compressor LoRA (+ context_embed) + HTM predictor
         if model_args.use_htm:
             base = model.get_base_model() if hasattr(model, "get_base_model") else model
-            if base.htm_predictor is not None:
-                for p in base.htm_predictor.parameters():
-                    p.requires_grad = True
+            if base.htm_predictor is None:
+                raise RuntimeError("use_htm Stage B requires initialize_htm")
+            for p in base.htm_predictor.parameters():
+                p.requires_grad = True
+            rank0(
+                "HTM Stage B: trainable = compressor LoRA + context_embed + htm_predictor "
+                "(λ=%.3f; K_r=0 in train)",
+                model_args.htm_lambda,
+            )
     summarise_trainables(model)
 
     model.config.use_cache = False

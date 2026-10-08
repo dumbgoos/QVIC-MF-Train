@@ -113,7 +113,7 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict
             )
-            # #@HTM — Stage A trains L_pred; LM path may stay frozen (K_r may be 0)
+            # #@HTM — Stage A: L_pred (+ optional λ_lm * L_LM); Stage B: L_LM + λ L_pred
             if getattr(self, "use_htm", False) and getattr(self, "htm_pred_loss", None) is not None:
                 pred = self.htm_pred_loss
                 if getattr(self, "htm_stage_a", False):
@@ -123,7 +123,8 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
                     else:
                         outputs.loss = pred + lm_w * outputs.loss
                 else:
-                    w = float(getattr(self, "htm_pred_weight", 1.0))
+                    # #@HTM Stage B joint loss (htm_pred_weight ← --htm_lambda)
+                    w = float(getattr(self, "htm_pred_weight", 0.1))
                     outputs.loss = (outputs.loss if outputs.loss is not None else 0.0) + w * pred
             return outputs
             

@@ -112,7 +112,7 @@ class QViCMetaMixin:
         self.htm_controller = None
         self.htm_pred_loss = None
         self.htm_recent_window = 4
-        self.htm_pred_weight = 1.0
+        self.htm_pred_weight = 0.1  # #@HTM Stage B default λ on L_pred
         self.htm_lambda_lm = 0.0  # Stage A: optimize L_pred only by default
 
     @abstractmethod
@@ -120,8 +120,8 @@ class QViCMetaMixin:
         pass
 
     # #@HTM
-    def initialize_htm(self, hidden_size=None, recent_window_W=4, quantile=0.75):
-        """Attach GRU predictor + online memory controller (Stage A write path)."""
+    def initialize_htm(self, hidden_size=None, recent_window_W=4, quantile=0.9):
+        """Attach GRU predictor + online memory controller (write path)."""
         dim = self.get_model().config.hidden_size
         self.htm_predictor = HTMPredictor(dim=dim, hidden_size=hidden_size)
         L = self.context_memory_length or getattr(self.config, "context_memory_length", 256)

@@ -61,7 +61,7 @@ class HTMPredictor(nn.Module):
 class QuantileThresholds:
     """Adaptive τ_s / τ_d from a rolling score buffer (~70–80th percentile)."""
 
-    def __init__(self, quantile: float = 0.75, maxlen: int = 4096, warmup: int = 32):
+    def __init__(self, quantile: float = 0.9, maxlen: int = 4096, warmup: int = 32):  # #@HTM locked default
         self.quantile = float(quantile)
         self.warmup = int(warmup)
         self._s: Deque[float] = deque(maxlen=maxlen)
@@ -121,7 +121,7 @@ class HTMMemoryController:
         alpha: float = 1.0,
         beta: float = 0.0,
         gamma: float = 0.01,
-        quantile: float = 0.75,
+        quantile: float = 0.9,  # #@HTM locked default
     ):
         self.L = int(token_budget_L)
         self.W = int(recent_window_W)
