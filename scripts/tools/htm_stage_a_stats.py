@@ -260,6 +260,46 @@ def load_context_cache(cache_dir: str, limit: int) -> List[Tuple[str, torch.Tens
 
 
 # #@HTM
+def _resolve_torch_dtype(name: str, device: torch.device) -> torch.dtype:
+    """Parse ``--torch-dtype`` / env; default bf16 on CUDA else fp32."""
+    key = (name or "").strip().lower()
+    if key in ("", "auto"):
+        return torch.bfloat16 if device.type == "cuda" else torch.float32
+    mapping = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    if key not in mapping:
+        raise ValueError(f"unsupported torch dtype: {name}")
+    return mapping[key]
+
+
+# #@HTM
+def _model_compute_dtype(model) -> torch.dtype:
+    """Prefer encoder weight dtype (q_proj matmul); fall back to any param."""
+    encoder = getattr(model, "encoder", None)
+    if encoder is not None:
+        try:
+            return next(encoder.parameters()).dtype
+        except StopIteration:
+            pass
+    return next(model.parameters()).dtype
+
+
+# #@HTM
+def _align_encode_inputs_dtype(inputs_embeds: torch.Tensor, model) -> torch.Tensor:
+    """Cast encoder inputs to model compute dtype (avoids Float vs BFloat16 at q_proj)."""
+    target = _model_compute_dtype(model)
+    if inputs_embeds.dtype != target:
+        return inputs_embeds.to(dtype=target)
+    return inputs_embeds
+
+
+# #@HTM
 def encode_videos_to_clips(
     records: List[Dict[str, Any]],
     args: argparse.Namespace,
@@ -280,7 +320,8 @@ def encode_videos_to_clips(
     config.context_embed_tokens = args.context_tokens
     config.context_memory_length = args.token_budget_L
 
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype = _resolve_torch_dtype(getattr(args, "torch_dtype", "auto"), device)
+    print(f"[htm-stats] load/encode dtype={dtype}", flush=True)
     model = LlavaQwenForCausalLM.from_pretrained(
         model_base, torch_dtype=dtype, low_cpu_mem_usage=True, attn_implementation="sdpa"
     )
@@ -295,6 +336,9 @@ def encode_videos_to_clips(
         ctx_attn_mask_type = "framewise"
 
     model.initialize_context_embed(_MA)
+    # #@HTM — freshly created Embedding defaults to fp32; match frozen bf16 encoder
+    # (same as train_qvic.build_model: model.context_embed.to(dtype=compute_dtype)).
+    model.context_embed.to(dtype=dtype)
     model.set_context_memory_length(args.token_budget_L)
     model.max_frame_num_encoder = args.num_frames
     model.context_condition_frame_num = 0
@@ -303,8 +347,15 @@ def encode_videos_to_clips(
     # #@HTM — stats encode path only needs the frozen compressor; HTM write runs later.
     model.use_htm = False
 
-    model.to(device)
+    model.to(device=device, dtype=dtype)
     model.eval()
+    compute_dtype = _model_compute_dtype(model)
+    if compute_dtype != dtype:
+        print(
+            f"[htm-stats] warning: requested dtype={dtype} but model params are "
+            f"{compute_dtype}; encode path will follow model params",
+            flush=True,
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
     if tokenizer.pad_token_id is None:
@@ -347,7 +398,8 @@ def encode_videos_to_clips(
         pixel_values = image_processor.preprocess(frames, return_tensors="pt")[
             "pixel_values"
         ]
-        pixel_values = pixel_values.to(device=device, dtype=dtype)
+        # Match vision/encoder compute dtype (not fp32 leftovers on a bf16 model).
+        pixel_values = pixel_values.to(device=device, dtype=compute_dtype)
         clips = _reencode_context_clips(model, pixel_values, input_ids_q)
         results.append((vid, clips.cpu().float()))
         if args.dump_context_cache:
@@ -366,6 +418,10 @@ def _reencode_context_clips(model, pixel_values, input_ids_q) -> torch.Tensor:
     num_frame_clip = model.max_frame_num_encoder
     clip_tensors: List[torch.Tensor] = []
     model.context_memory = None
+    compute_dtype = _model_compute_dtype(model)
+    # Keep pixel/vision activations on the encode path in compute dtype.
+    if pixel_values.dtype != compute_dtype:
+        pixel_values = pixel_values.to(dtype=compute_dtype)
     num_clips = (T + num_frame_clip - 1) // num_frame_clip
     for i_clip in range(num_clips):
         start = i_clip * num_frame_clip
@@ -390,6 +446,9 @@ def _reencode_context_clips(model, pixel_values, input_ids_q) -> torch.Tensor:
             modalities,
             None,
         )
+        # #@HTM — safety net: multimodal prep can leave fp32 embeds (e.g. context_embed)
+        # while encoder q_proj is bf16 → RuntimeError Float vs BFloat16.
+        inputs_embeds_ = _align_encode_inputs_dtype(inputs_embeds_, model)
         with torch.no_grad():
             encoder_outputs = model.forward_encoder(
                 inputs_embeds_,
@@ -554,6 +613,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--mf-baseline", action="store_true", default=True)
     p.add_argument("--no-mf-baseline", action="store_true")
     p.add_argument("--device", default=os.environ.get("DEVICE", "cpu"))
+    p.add_argument(
+        "--torch-dtype",
+        default=os.environ.get("TORCH_DTYPE", "auto"),
+        help="auto|bfloat16|float16|float32 (encode load + activations; auto=bf16 on CUDA)",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--keep-steps",
