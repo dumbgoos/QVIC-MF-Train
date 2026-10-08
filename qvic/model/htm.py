@@ -149,12 +149,14 @@ class HTMMemoryController:
         c_tokens: torch.Tensor,  # [C, D]
         predictor: HTMPredictor,
         collect_threshold_stats: bool,
+        step_stats: Optional[List[Dict]] = None,  # #@HTM
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Advance one sample by one clip. Returns (c_bar detached, pred_loss or None)."""
         c_bar = c_tokens.mean(dim=0)  # [D]
         c_bar_det = c_bar.detach()
         pred_loss: Optional[torch.Tensor] = None
         S_t = 0.0
+        has_pred = state.c_hat is not None
 
         if state.c_hat is not None:
             # Surprise vs prediction; L_pred uses stop-grad target (design §4.3).
@@ -178,10 +180,12 @@ class HTMMemoryController:
                 # Warmup: merge when both scores are below running means (lenient).
                 merge = (S_t < self.thresholds.tau_s) and (D_t < self.thresholds.tau_d)
 
+        action = "open"
         if state.open_event is None:
             state.open_event = HTMEvent(
                 z=c_bar_det.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1
             )
+            action = "open"
         elif merge:
             ev = state.open_event
             n = ev.n
@@ -189,11 +193,13 @@ class HTMMemoryController:
             ev.n = n + 1
             ev.t_e = state.t
             ev.S = max(ev.S, S_t)  # max aggregate (design §11)
+            action = "merge"
         else:
             state.events.append(state.open_event)
             state.open_event = HTMEvent(
                 z=c_bar_det.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1
             )
+            action = "new_event"
 
         # Recent window keeps raw C tokens.
         state.recent.append(c_tokens.detach())
@@ -203,9 +209,42 @@ class HTMMemoryController:
         c_hat_next, h_new = predictor.forward_step(c_bar_det.unsqueeze(0), state.h)
         state.h = h_new.detach()
         state.c_hat = c_hat_next.squeeze(0)
+        t_idx = state.t
         state.t += 1
         state.age_counter += 1
+
+        # #@HTM — optional per-clip telemetry for Stage A stats tooling
+        if step_stats is not None:
+            n_events = len(state.events) + (1 if state.open_event is not None else 0)
+            step_stats.append({
+                "t": t_idx,
+                "S_t": S_t if has_pred else None,
+                "D_t": None if D_t == float("inf") else D_t,
+                "merged": action == "merge",
+                "action": action,
+                "n_events": n_events,
+                "tau_s": self.thresholds.tau_s,
+                "tau_d": self.thresholds.tau_d,
+            })
         return c_bar_det, pred_loss
+
+    # #@HTM
+    def memory_composition(self, state: HTMSampleState) -> Dict:
+        """Token-budget accounting for Stage A stats (|M| = recent·C + events·1)."""
+        recent_raw_tokens = int(sum(int(c.shape[0]) for c in state.recent))
+        n_events = len(state.events) + (1 if state.open_event is not None else 0)
+        event_tokens = int(n_events)  # each event costs 1 context token
+        mem = self.build_memory_tokens(state)
+        final_M = int(mem.shape[0]) if mem.numel() else 0
+        return {
+            "recent_raw_tokens": recent_raw_tokens,
+            "event_tokens": event_tokens,
+            "n_events": n_events,
+            "n_recent_clips": len(state.recent),
+            "final_M": final_M,
+            "token_budget_L": self.L,
+            "final_M_over_L": (final_M / self.L) if self.L > 0 else None,
+        }
 
     def build_memory_tokens(self, state: HTMSampleState) -> torch.Tensor:
         """Flat readable memory ``[T, D]`` with costs C (recent) vs 1 (event), ``T ≤ L``."""
