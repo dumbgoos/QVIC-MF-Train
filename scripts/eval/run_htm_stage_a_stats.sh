@@ -27,8 +27,11 @@ LIMIT="${LIMIT:-8}"
 L="${L:-256}"
 C="${C:-16}"
 W="${W:-4}"
+# #@HTM — Python default is still 0.75; Stage B eval must set QUANTILE=0.9.
+QUANTILE="${QUANTILE:-}"
 DEVICE="${DEVICE:-cpu}"
 ENCODE_VIDEOS="${ENCODE_VIDEOS:-0}"
+TORCH_DTYPE="${TORCH_DTYPE:-}"
 PYTHON="${QVIC_PY:-python}"
 
 if ! mkdir -p "$(dirname "$HTM_STATS_OUT")" 2>/dev/null; then
@@ -39,7 +42,7 @@ fi
 export PYTHONPATH="$QVIC_ROOT:${PYTHONPATH:-}"
 
 echo "[htm-stats] root=$QVIC_ROOT (server code often at $CODE_HINT)"
-echo "[htm-stats] ckpt=$HTM_CKPT  out=$HTM_STATS_OUT  limit=$LIMIT device=$DEVICE"
+echo "[htm-stats] ckpt=$HTM_CKPT  out=$HTM_STATS_OUT  limit=$LIMIT device=$DEVICE quantile=${QUANTILE:-"(python default)"}"
 
 EXTRA=()
 if [ "$ENCODE_VIDEOS" = "1" ] || [ "$ENCODE_VIDEOS" = "true" ]; then
@@ -47,6 +50,13 @@ if [ "$ENCODE_VIDEOS" = "1" ] || [ "$ENCODE_VIDEOS" = "true" ]; then
 else
   # #@HTM — CPU-friendly default when not encoding real videos
   EXTRA+=(--smoke)
+fi
+# #@HTM — forward QUANTILE / TORCH_DTYPE when set (Stage B needs 0.9 + bf16 encode).
+if [ -n "$QUANTILE" ]; then
+  EXTRA+=(--quantile "$QUANTILE")
+fi
+if [ -n "$TORCH_DTYPE" ]; then
+  EXTRA+=(--torch-dtype "$TORCH_DTYPE")
 fi
 
 # Prefer python3 when QVIC_PY unset and python is missing (dev boxes).

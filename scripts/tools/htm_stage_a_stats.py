@@ -9,8 +9,10 @@ Modes
 -----
 * ``--smoke`` (default when no annotation path / encode): synthetic temporally
   coherent context tokens — CPU-friendly, no VLM weights.
-* ``--annotation-path`` + ``--encode-videos``: load compressor + Stage A
-  ``htm_predictor`` checkpoint and encode a LIMIT subset of real videos.
+* ``--annotation-path`` + ``--encode-videos``: load compressor + checkpoint
+  ``htm_predictor``; when the ckpt has ``adapter_model.bin`` +
+  ``context_embed`` in ``non_lora_trainables.bin`` (Stage B), also load those
+  for full write-path encode. Stage A (no adapter) stays predictor-only.
 * ``--context-cache DIR``: load precomputed ``*.pt`` tensors shaped ``[T, C, D]``.
 
 Does **not** run VQA. See ``scripts/eval/run_htm_stage_a_qa_smoke.sh`` / docs
@@ -110,6 +112,96 @@ def load_htm_predictor_weights(
     if unexpected:
         notes.append(f"unexpected_keys={list(unexpected)}")
     return notes
+
+
+# #@HTM
+def load_encode_checkpoint_weights(
+    model,
+    checkpoint: str,
+    dtype: torch.dtype,
+) -> Tuple[Any, List[str], Dict[str, bool]]:
+    """Load Stage B compressor pieces for stats encode: ``context_embed`` + Peft LoRA.
+
+    Mirrors ``builder.load_pretrained_model`` QViC branch (non-LoRA then
+    ``PeftModel.from_pretrained`` + ``merge_and_unload``), but only pulls
+    ``context_embed.*`` from ``non_lora_trainables.bin`` so ``htm_predictor.*``
+    keys do not require ``initialize_htm`` on the encode path.
+
+    Stage A ckpts without adapter / ``context_embed`` skip those pieces
+    gracefully (predictor-only encode against base compressor).
+    """
+    notes: List[str] = []
+    status = {"context_embed_loaded": False, "lora_loaded": False}
+    ckpt = Path(checkpoint)
+    if not ckpt.is_dir():
+        notes.append(f"encode ckpt not a dir (skip LoRA/context_embed): {checkpoint}")
+        return model, notes, status
+
+    bin_path = ckpt / "non_lora_trainables.bin"
+    if bin_path.is_file():
+        raw = torch.load(str(bin_path), map_location="cpu")
+        if not isinstance(raw, dict):
+            notes.append(f"non_lora_trainables not a dict; skip context_embed: {bin_path}")
+        else:
+            cleaned: Dict[str, torch.Tensor] = {}
+            for k, v in raw.items():
+                key = k
+                matched = False
+                for prefix in (
+                    "base_model.model.context_embed.",
+                    "base_model.context_embed.",
+                    "model.context_embed.",
+                    "context_embed.",
+                ):
+                    if key.startswith(prefix):
+                        key = "context_embed." + key[len(prefix) :]
+                        matched = True
+                        break
+                if matched:
+                    cleaned[key] = v
+            if cleaned:
+                missing, unexpected = model.load_state_dict(cleaned, strict=False)
+                # #@HTM — bin may be fp32; match encoder bf16 (same prior dtype bug).
+                if getattr(model, "context_embed", None) is not None:
+                    model.context_embed.to(dtype=dtype)
+                status["context_embed_loaded"] = True
+                notes.append(
+                    f"loaded context_embed ({len(cleaned)} tensors) from {bin_path}"
+                )
+                if missing:
+                    notes.append(f"context_embed missing_keys={list(missing)}")
+                if unexpected:
+                    notes.append(f"context_embed unexpected_keys={list(unexpected)}")
+            else:
+                notes.append(
+                    f"no context_embed.* in {bin_path} (ok for Stage A / predictor-only)"
+                )
+    else:
+        notes.append(f"non_lora_trainables.bin missing; skip context_embed load")
+
+    adapter_bin = ckpt / "adapter_model.bin"
+    adapter_cfg = ckpt / "adapter_config.json"
+    if adapter_bin.is_file() and adapter_cfg.is_file():
+        from peft import PeftModel
+
+        print(f"[htm-stats] loading Peft LoRA compressor from {ckpt}", flush=True)
+        # #@HTM — same order as builder QViC branch: Peft then merge for encode.
+        model = PeftModel.from_pretrained(model, str(ckpt))
+        model = model.merge_and_unload()
+        model.to(dtype=dtype)
+        status["lora_loaded"] = True
+        notes.append(f"loaded+merged Peft LoRA from {adapter_bin}")
+    elif adapter_bin.is_file() or adapter_cfg.is_file():
+        notes.append(
+            f"incomplete Peft adapter in {ckpt} "
+            "(need adapter_model.bin + adapter_config.json); skip LoRA"
+        )
+    else:
+        notes.append(
+            f"no Peft adapter in {ckpt} (predictor-only / Stage A ok)"
+        )
+
+    return model, notes, status
 
 
 # #@HTM
@@ -304,8 +396,12 @@ def encode_videos_to_clips(
     records: List[Dict[str, Any]],
     args: argparse.Namespace,
     device: torch.device,
-) -> List[Tuple[str, torch.Tensor]]:
-    """Encode videos with the frozen compressor; return per-video [T,C,D] clips."""
+) -> Tuple[List[Tuple[str, torch.Tensor]], List[str], Dict[str, bool]]:
+    """Encode videos with compressor (+ Stage B LoRA/context_embed when present).
+
+    Returns ``(streams, encode_notes, encode_status)`` where status flags report
+    whether ``context_embed`` / Peft LoRA were loaded from ``args.checkpoint``.
+    """
     # Import heavy stack only when encoding.
     sys.path.insert(0, str(_REPO_ROOT))
     from transformers import AutoTokenizer
@@ -339,12 +435,28 @@ def encode_videos_to_clips(
     # #@HTM — freshly created Embedding defaults to fp32; match frozen bf16 encoder
     # (same as train_qvic.build_model: model.context_embed.to(dtype=compute_dtype)).
     model.context_embed.to(dtype=dtype)
+
+    # #@HTM — Stage B full write-path encode: context_embed + compressor LoRA.
+    # Stage A (no adapter / no context_embed in non_lora) skips gracefully.
+    encode_notes: List[str] = []
+    encode_status = {"context_embed_loaded": False, "lora_loaded": False}
+    if args.checkpoint and os.path.isdir(args.checkpoint):
+        model, encode_notes, encode_status = load_encode_checkpoint_weights(
+            model, args.checkpoint, dtype
+        )
+        for n in encode_notes:
+            print(f"[htm-stats] {n}", flush=True)
+    elif args.checkpoint:
+        encode_notes.append(
+            f"encode ckpt not a dir (skip LoRA/context_embed): {args.checkpoint}"
+        )
+
     model.set_context_memory_length(args.token_budget_L)
     model.max_frame_num_encoder = args.num_frames
     model.context_condition_frame_num = 0
     model.compress_with_relevance = False
     model.fill_context_memory = False
-    # #@HTM — stats encode path only needs the frozen compressor; HTM write runs later.
+    # #@HTM — stats encode path only needs the compressor; HTM write runs later.
     model.use_htm = False
 
     model.to(device=device, dtype=dtype)
@@ -409,7 +521,7 @@ def encode_videos_to_clips(
                 {"video_id": vid, "clips": clips.cpu()},
                 os.path.join(args.dump_context_cache, f"{safe}.pt"),
             )
-    return results
+    return results, encode_notes, encode_status
 
 
 def _reencode_context_clips(model, pixel_values, input_ids_q) -> torch.Tensor:
@@ -640,11 +752,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     video_list = [x.strip() for x in args.video_list.split(",") if x.strip()] or None
     streams: List[Tuple[str, torch.Tensor]] = []
     load_notes: List[str] = []
+    encode_status = {"context_embed_loaded": False, "lora_loaded": False}
     mode = "smoke"
 
     if args.context_cache:
         mode = "context_cache"
         streams = load_context_cache(args.context_cache, args.limit)
+        load_notes.append(
+            "context_cache mode: compressor LoRA/context_embed already baked into "
+            "*.pt (re-encode with --encode-videos for Stage B full load)"
+        )
     elif args.encode_videos and not args.smoke:
         mode = "encode_videos"
         if not os.path.isfile(args.annotation_path):
@@ -658,7 +775,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             records = load_annotation_subset(
                 args.annotation_path, args.limit, video_list
             )
-            streams = encode_videos_to_clips(records, args, device)
+            streams, enc_notes, encode_status = encode_videos_to_clips(
+                records, args, device
+            )
+            load_notes.extend(enc_notes)
     else:
         # Auto-smoke when encode not requested (CPU-friendly default).
         mode = "smoke"
@@ -720,11 +840,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             htm.pop("steps", None)
         rows.append(row)
 
+    # #@HTM — Stage B full encode = predictor + LoRA + context_embed on encode path.
+    stage_b_full = bool(
+        ckpt_loaded
+        and encode_status.get("lora_loaded")
+        and encode_status.get("context_embed_loaded")
+    )
     payload = {
         "config": {
             "mode": mode,
             "checkpoint": args.checkpoint,
             "checkpoint_loaded": ckpt_loaded,
+            "encode_context_embed_loaded": encode_status.get(
+                "context_embed_loaded", False
+            ),
+            "encode_lora_loaded": encode_status.get("lora_loaded", False),
+            "stage_b_full_encode_load": stage_b_full,
             "model_base": args.model_base,
             "annotation_path": args.annotation_path,
             "dataset_root": args.dataset_root,
