@@ -1,14 +1,11 @@
 #!/bin/bash
-# #@HTM — QA smoke *hook* for HTM Stage A (does NOT invent a new benchmark harness).
+# #@HTM — QA smoke hook for HTM Stage A (thin wrapper; no new benchmark harness).
 #
-# Status (2026-10): existing ``qvic/eval/model_video_lvbench.py`` / ``model_vqa.py``
-# load QViC via ``builder.load_pretrained_model`` but do **not** yet call
-# ``initialize_htm`` / load ``htm_predictor`` from Stage A ``non_lora_trainables.bin``.
-# Wiring that into the eval entrypoints is a small follow-up; until then this
-# script documents the exact next commands and exits non-zero if HTM is not wired.
+# HTM load path is now wired in builder + model_video_lvbench (see Stage B wrapper
+# for the primary smoke Leo should run on checkpoint-5000 Stage B).
 #
-# Stage A success (design §7–§8): token usage ↓ ~30–50% (see stats script) AND
-# QA not significantly hurt. Beating MF at same L is Stage B — not required here.
+# Stage A success (design §7–§8): token usage ↓ ~30–50% (stats) AND QA not
+# significantly hurt. Beating MF at same L is Stage B.
 #
 set -euo pipefail
 
@@ -19,8 +16,8 @@ HTM_CKPT="${HTM_CKPT:-/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_a_2x
 MODEL_BASE="${MODEL_BASE:-lmms-lab/LLaVA-Video-7B-Qwen2}"
 OUT_PARENT="${OUT_PARENT:-/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_a_2xh100}"
 QA_OUT="${QA_OUT:-$OUT_PARENT/qa_smoke}"
+QUANTILE="${QUANTILE:-0.9}"
 
-# Optional: set these to attempt a real LVBench-style smoke with existing eval.
 VIDEO_DIR="${VIDEO_DIR:-}"
 QUESTION_FP="${QUESTION_FP:-}"
 RUN_EXISTING="${RUN_EXISTING:-0}"
@@ -30,14 +27,13 @@ cat <<EOF
   checkpoint : $HTM_CKPT
   model_base : $MODEL_BASE
   out        : $QA_OUT
+  quantile   : $QUANTILE
 
-Covered by stats tooling (not this script):
-  - token budget |M|, merges, S_t/D_t  →  scripts/eval/run_htm_stage_a_stats.sh
+Note: Stage A ckpts may lack adapter_model.bin (predictor-only). The QViC LoRA
+builder branch asserts adapter — for full compressor+HTM QA prefer Stage B:
+  bash scripts/eval/run_htm_stage_b_qa_smoke.sh
 
-NOT covered yet (needs eval entrypoint HTM load):
-  - full VQA accuracy vs MF on the same clips / same L
-
-Exact next command once HTM is wired into qvic/eval (LVBench-style):
+If Stage A dir has adapter + non_lora (unusual), LVBench-style command:
   mkdir -p "$QA_OUT"
   python -m qvic.eval.model_video_lvbench \\
     --model-path "$HTM_CKPT" \\
@@ -49,19 +45,11 @@ Exact next command once HTM is wired into qvic/eval (LVBench-style):
     --frames_num 64 \\
     --context_memory_length 256 \\
     --compress_with_relevance False \\
+    --htm_stage_a True \\
+    --htm_quantile $QUANTILE \\
     --torch_dtype bfloat16
 
-Required wiring (follow-up, minimal):
-  1. After load_pretrained_model(...), call:
-       model.initialize_htm(recent_window_W=4, quantile=0.75)
-       model.set_use_htm(True); model.set_htm_stage_a(True)
-  2. Load htm_predictor.* from \$HTM_CKPT/non_lora_trainables.bin
-     (same key stripping as scripts/tools/htm_stage_a_stats.py).
-  3. Keep K_r off for an apples-to-apples Stage A write-path check, or enable
-     compress_with_relevance only when comparing read-path behavior.
-
-Until that lands, use token stats as the primary Stage A gate and treat QA as
-blocked on eval HTM load — do not invent a parallel benchmark harness.
+Write-path fair compare: K_r=0 (--compress_with_relevance False).
 EOF
 
 if [ "$RUN_EXISTING" != "1" ]; then
@@ -76,7 +64,6 @@ fi
 
 mkdir -p "$QA_OUT"
 export PYTHONPATH="$QVIC_ROOT:${PYTHONPATH:-}"
-# Warning: without HTM wiring this runs MF/base write path only.
 python -m qvic.eval.model_video_lvbench \
   --model-path "$HTM_CKPT" \
   --model-base "$MODEL_BASE" \
@@ -87,4 +74,6 @@ python -m qvic.eval.model_video_lvbench \
   --frames_num 64 \
   --context_memory_length 256 \
   --compress_with_relevance False \
+  --htm_stage_a True \
+  --htm_quantile "$QUANTILE" \
   --torch_dtype bfloat16

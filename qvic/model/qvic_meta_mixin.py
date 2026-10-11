@@ -170,6 +170,9 @@ class QViCMetaMixin:
 
     def set_context_memory_length(self, context_memory_length):
         self.context_memory_length = context_memory_length
+        # #@HTM — keep controller token budget in sync (eval sets L after builder init)
+        if getattr(self, "htm_controller", None) is not None:
+            self.htm_controller.L = int(context_memory_length)
         rank0_print(f"context_memory_length: {self.context_memory_length} (updated)")
 
     def set_norm_loss_weight(self, norm_loss_weight):
