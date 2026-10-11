@@ -4,6 +4,7 @@ import torch
 from operator import attrgetter
 from qvic.model.builder import load_pretrained_model
 from qvic.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token
+from qvic.eval.htm_eval_utils import resolve_htm_model_name, apply_htm_eval_runtime  # #@HTM
 from qvic.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IGNORE_INDEX
 from qvic.conversation import conv_templates, SeparatorStyle
 
@@ -80,6 +81,11 @@ def parse_args():
     parser.add_argument("--min_frames_num", type=int, default=64)
     parser.add_argument("--compress_with_relevance", type=lambda x: (str(x).lower() == 'true'), default=True)
     parser.add_argument("--context_condition_frame_num", type=int, default=32)
+    # #@HTM — Stage B QA smoke defaults: joint write path, QUANTILE=0.9; keep K_r off via compress_with_relevance False
+    parser.add_argument("--htm_stage_a", type=lambda x: (str(x).lower() == 'true'), default=False,
+                        help="True = Stage A (freeze-compressor write); False = Stage B joint (default).")
+    parser.add_argument("--htm_quantile", type=float, default=0.9,
+                        help="HTM merge quantile (locked Stage B eval default 0.9).")
     
     return parser.parse_args()
 
@@ -141,7 +147,8 @@ def run_inference(args):
     compress_with_relevance = args.compress_with_relevance
     context_condition_frame_num = args.context_condition_frame_num
     
-    model_name = get_model_name_from_path(pretrained)
+    # #@HTM — force QViC/HTM builder branch when ckpt path lacks "qvic"/"lora"
+    model_name = resolve_htm_model_name(pretrained, model_base)
     device = "cuda"
     device_map = "auto"
     tokenizer, model, image_processor, max_length = load_pretrained_model(
@@ -152,6 +159,13 @@ def run_inference(args):
     model.set_verbose(set_verbose)
     model.set_compress_with_relevance(compress_with_relevance)
     model.set_context_condition_frame_num(context_condition_frame_num)
+    # #@HTM — builder already loaded htm_predictor when present; finish Stage A/B knobs
+    apply_htm_eval_runtime(
+        model,
+        htm_stage_a=args.htm_stage_a,
+        htm_quantile=args.htm_quantile,
+        context_memory_length=context_memory_length,
+    )
 
     if '.jsonl' in args.question_fp:
         question_dict = [json.loads(q) for q in open(os.path.expanduser(args.question_fp), "r")]

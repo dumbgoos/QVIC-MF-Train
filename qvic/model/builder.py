@@ -24,6 +24,35 @@ from qvic.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DE
 from qvic.utils import rank0_print
 
 
+# #@HTM — Stage A/B ckpt dirs are often named htm_stage_* (no "qvic"/"lora" in the path).
+def _name_is_qvic_or_htm(model_name: str) -> bool:
+    name = (model_name or "").lower()
+    return "qvic" in name or "htm" in name
+
+
+# #@HTM
+def _normalize_qvic_non_lora_state_dict(raw):
+    """Map saved non-LoRA keys onto ``context_embed.*`` / ``htm_predictor.*`` module paths."""
+    out = {}
+    has_htm = False
+    for k, v in raw.items():
+        key = k
+        if key.startswith("base_model.model."):
+            key = key[len("base_model.model.") :]
+        elif key.startswith("base_model."):
+            key = key[len("base_model.") :]
+        if key.startswith("model.context_embed.") or key.startswith("model.htm_predictor."):
+            key = key[len("model.") :]
+        # Legacy builder only rewrote this one prefix form.
+        key = key.replace("base_model.model.context_embed.", "context_embed.")
+        if key.startswith("htm_predictor.") or key.startswith("gru.") or key.startswith("proj."):
+            if key.startswith("gru.") or key.startswith("proj."):
+                key = "htm_predictor." + key
+            has_htm = True
+        out[key] = v
+    return out, has_htm
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", torch_dtype="float16",attn_implementation="flash_attention_2", customized_config=None, overwrite_config=None, **kwargs):
     kwargs["device_map"] = device_map
 
@@ -51,9 +80,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         
     rank0_print(f"model_name: {model_name}")
 
-    if ("llava" in model_name.lower() or "qvic" in model_name.lower()) or is_multimodal:
+    # #@HTM — also treat "htm" names as multimodal QViC family (Stage A/B ckpt dirs).
+    if ("llava" in model_name.lower() or _name_is_qvic_or_htm(model_name)) or is_multimodal:
         # Load LLaVA model
-        if ("lora" in model_name.lower() or "qvic" in model_name.lower()) and model_base is None:
+        if ("lora" in model_name.lower() or _name_is_qvic_or_htm(model_name)) and model_base is None:
             warnings.warn(
                 "There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged."
             )
@@ -120,7 +150,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         # the dedicated context encoder, and the QViC LoRA adapters. This is the
         # single biggest QViC-specific block in this file; all upstream LLaVA-NeXT
         # branches above and below remain untouched.
-        elif "qvic" in model_name.lower() and model_base is not None:
+        # #@HTM — also enter for "htm" model_name (Stage A/B dirs lack "qvic"/"lora").
+        elif _name_is_qvic_or_htm(model_name) and model_base is not None:
             cfg_pretrained = AutoConfig.from_pretrained(model_path)
 
             if overwrite_config is not None:
@@ -149,13 +180,22 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             rank0_print(f'(LoRA) Loading context embedding from {model_path}')
             model.initialize_context_embed(cfg_pretrained)
             non_lora_trainables = torch.load(os.path.join(model_path, 'non_lora_trainables.bin'), map_location='cpu')
-            non_lora_trainables = {k.replace('base_model.model.context_embed.', 'context_embed.'): v for k, v in non_lora_trainables.items()}
+            # #@HTM — normalize keys; initialize GRU before load so htm_predictor.* is expected.
+            non_lora_trainables, has_htm = _normalize_qvic_non_lora_state_dict(non_lora_trainables)
+            if has_htm and hasattr(model, "initialize_htm"):
+                # QUANTILE=0.9 locked default; eval may rebuild controller after set_context_memory_length.
+                model.initialize_htm(recent_window_W=4, quantile=0.9)
+                model.set_use_htm(True)
+                rank0_print(f'(HTM) initialize_htm before non_lora load from {model_path}')
             if len(non_lora_trainables) == 0:
                 rank0_print(f'[WARNING] No non-lora trainables found in {model_path}. If avepool, ignore this.')
                 breakpoint()
             ret = model.load_state_dict(non_lora_trainables, strict=False)
             if len(ret.unexpected_keys) > 0:
                 raise ValueError(f"Unexpected keys in loading rola trainables: {ret.unexpected_keys} from {model_path}")
+            if has_htm:
+                n_htm = sum(1 for k in non_lora_trainables if k.startswith("htm_predictor."))
+                rank0_print(f'(HTM) loaded {n_htm} htm_predictor tensors from non_lora_trainables.bin')
 
             rank0_print(f'(LoRA) Loading encoder/decoder LoRA from {model_path}')
 
@@ -347,7 +387,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     rank0_print(f"Model Class: {model.__class__.__name__}")
     image_processor = None
 
-    if "llava" in model_name.lower() or "qvic" in model_name.lower() or is_multimodal:
+    # #@HTM — keep vision tower path for htm_* model names
+    if "llava" in model_name.lower() or _name_is_qvic_or_htm(model_name) or is_multimodal:
         mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
         mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
         if mm_use_im_patch_token:
