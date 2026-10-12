@@ -58,6 +58,23 @@ def main() -> None:
     dist = htm_distance(a, b)
     assert dist.shape == (4,)
 
+    # #@HTM — eval path leaves predictor on CPU while features may be on CUDA;
+    # write_batch must re-align without hardcoding cuda:0.
+    device_sync = "skipped"
+    if torch.cuda.is_available():
+        feat_device = torch.device("cuda", torch.cuda.current_device())
+        pred_cpu = HTMPredictor(dim=D, hidden_size=16)
+        assert next(pred_cpu.parameters()).device.type == "cpu"
+        ctrl2 = HTMMemoryController(token_budget_L=L, recent_window_W=3, quantile=0.75)
+        ctrl2.reset(1)
+        frames_gpu = torch.randn(1, 1, C, D, device=feat_device, dtype=torch.float16)
+        step_gpu = ctrl2.write_batch(frames_gpu, pred_cpu, collect_threshold_stats=False)
+        p_dev = next(pred_cpu.parameters()).device
+        assert p_dev == feat_device, f"predictor still on {p_dev}, expected {feat_device}"
+        assert next(pred_cpu.parameters()).dtype == torch.float16
+        assert step_gpu is None or step_gpu.device == feat_device
+        device_sync = str(feat_device)
+
     print(
         "ok",
         {
@@ -67,6 +84,7 @@ def main() -> None:
             "tau_s": ctrl.thresholds.tau_s,
             "tau_d": ctrl.thresholds.tau_d,
             "events": [len(s.events) + (1 if s.open_event else 0) for s in ctrl.states],
+            "device_sync": device_sync,
         },
     )
 

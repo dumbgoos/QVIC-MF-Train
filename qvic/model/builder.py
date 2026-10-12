@@ -220,6 +220,13 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             rank0_print(f"Merging weights...")
             model = model.merge_and_unload()
             model.to(kwargs["torch_dtype"])
+            # #@HTM — device_map only places modules present at from_pretrained;
+            # GRU is attached later and must be moved explicitly (write_batch also
+            # re-aligns to feature device under multi-GPU auto maps).
+            if has_htm and getattr(model, "htm_predictor", None) is not None:
+                _htm_dtype = kwargs.get("torch_dtype", getattr(model, "dtype", torch.float16))
+                model.htm_predictor.to(device=model.device, dtype=_htm_dtype)
+                rank0_print(f'(HTM) moved htm_predictor to {model.device} dtype={_htm_dtype}')
             rank0_print("Model is loaded.")
         # === end QViC modification ===
 
