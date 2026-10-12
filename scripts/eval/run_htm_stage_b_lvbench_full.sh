@@ -63,7 +63,7 @@ cat <<EOF
   frames_num : $FRAMES_NUM  (official QViC-MF lvbench_eval_qvic.sh default)
   min_frames : $MIN_FRAMES_NUM
   L / q      : $CONTEXT_MEMORY_LENGTH / $QUANTILE
-  K_r        : off (compress_with_relevance=$COMPRESS_WITH_RELEVANCE)
+  K_r        : compress_with_relevance=$COMPRESS_WITH_RELEVANCE  (True=paper-matched; False=write-fair)
   htm_stage_a: False
   GPUs       : $CUDA_VISIBLE_DEVICES
 
