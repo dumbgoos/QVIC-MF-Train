@@ -874,6 +874,9 @@ class QViCMetaMixin:
                                 relevances.append(relevance_batch)  # B x [T]
 
                         relevances_outputs = torch.stack(relevances, dim=0)  # [B, T]
+                        # Free full-layer attention maps ASAP (64-frame K_r clips are multi-GiB).
+                        del output_attentions, relevances
+                        encoder_outputs = None
 
                     # Extract the part corresponding to the clip (excluding the recalled frames)
                     if self.compress_with_relevance and (num_frame_clip < self.max_frame_num_encoder) and recall_memory_indices is not None:
@@ -1142,7 +1145,11 @@ class QViCMetaMixin:
             if delete_tensor:
                 del self.frame_indices_memory
             self.frame_indices_memory = None
-        # #@HTM
+        if self.reflection_frequency is not None:
+            if delete_tensor:
+                del self.reflection_frequency
+            self.reflection_frequency = None
+        # #@HTM — drop event/recent token buffers so consecutive long videos do not retain peak VRAM
         if getattr(self, "htm_controller", None) is not None:
             self.htm_controller.states = []
         self.htm_pred_loss = None

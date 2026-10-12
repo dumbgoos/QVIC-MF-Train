@@ -20,7 +20,10 @@
 #     --input  /mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/video_info.meta.jsonl \
 #     --output /mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_full.jsonl
 #
-#   # 2) Run (1fps or 2fps). Multi-GPU: CUDA_VISIBLE_DEVICES=0,1,...
+#   # 2) Clear leftover GPU holders, then run (1fps or 2fps).
+#   #    Wrapper sets PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True by default.
+#   #    Multi-GPU: CUDA_VISIBLE_DEVICES=0,1,...
+#   nvidia-smi   # kill alien PIDs occupying the target GPU if needed
 #   RUN_EXISTING=1 VIDEO_FPS=1 \
 #     VIDEO_DIR=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/video/all_videos \
 #     QUESTION_FP=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_full.jsonl \
@@ -106,6 +109,10 @@ mkdir -p "$QA_OUT"
 export PYTHONPATH="$QVIC_ROOT:${PYTHONPATH:-}"
 export PYTHONWARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
+# Avoid CUDA caching-allocator fragmentation across consecutive long videos
+# (K_r=on → 64-frame SDPA ~11GiB). Override with PYTORCH_CUDA_ALLOC_CONF=... if needed.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+echo "[htm-lvbench-full] PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
 
 IFS=',' read -ra GPULIST <<< "$CUDA_VISIBLE_DEVICES"
 CHUNKS=${#GPULIST[@]}
