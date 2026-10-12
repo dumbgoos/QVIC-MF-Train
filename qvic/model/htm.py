@@ -304,6 +304,12 @@ class HTMMemoryController:
         collect_threshold_stats: bool,
     ) -> Optional[torch.Tensor]:
         """Write one frame/clip for a batch. Returns mean pred loss or None."""
+        # #@HTM — late-attached GRU is not covered by HF device_map="auto" and
+        # stays on CPU after eval load; match compressor feature device/dtype
+        # (same idea as context_embed.to(self.device) in the QViC mixin).
+        p0 = next(predictor.parameters())
+        if p0.device != context_frames.device or p0.dtype != context_frames.dtype:
+            predictor.to(device=context_frames.device, dtype=context_frames.dtype)
         B = context_frames.shape[0]
         self.ensure_batch(B)
         losses: List[torch.Tensor] = []

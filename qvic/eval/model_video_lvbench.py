@@ -1,4 +1,5 @@
 import argparse
+import gc
 import torch
 
 from operator import attrgetter
@@ -25,6 +26,21 @@ from tqdm import tqdm
 from decord import VideoReader, cpu
 
 import numpy as np
+
+
+def _teardown_qa_cuda(model):
+    """Reset HTM/MF buffers and return free CUDA blocks between QAs.
+
+    embed_video_streaming already resets context/relevance/HTM at encode start, but
+    the eval loop must drop the pixel video + generate temps (caller sets them to
+    None) and empty the caching allocator so sample N+1 can find a contiguous
+    ~11GiB block for 64-frame SDPA (K=32+K_r=32).
+    """
+    if hasattr(model, "clear_memory"):
+        model.clear_memory(delete_tensor=True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def split_list(lst, n):
@@ -188,6 +204,10 @@ def run_inference(args):
 
     index = 0
     for q_dict in tqdm(question_dict):
+        video = None
+        videos = None
+        input_ids = None
+        output_ids = None
 
         filename_prefix = q_dict['key'][:11] # "Cm73ma6Ibcs_55" -> "Cm73ma6Ibcs"
         video_path = os.path.join(args.video_dir, f"{filename_prefix}.mp4")
@@ -223,33 +243,41 @@ def run_inference(args):
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
         #image_sizes = [frame.size for frame in video_frames]
 
-        with torch.inference_mode():
-            output_ids = model.generate(
-                        input_ids,
-                        images=videos,
-                        image_sizes=image_sizes,
-                        do_sample=False,
-                        temperature=0,
-                        max_new_tokens=5,
-                        modalities=["video"],
-                        input_ids_q=input_ids,
-                    )
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
-        outputs = outputs.strip()
+        try:
+            with torch.inference_mode():
+                output_ids = model.generate(
+                            input_ids,
+                            images=videos,
+                            image_sizes=image_sizes,
+                            do_sample=False,
+                            temperature=0,
+                            max_new_tokens=5,
+                            modalities=["video"],
+                            input_ids_q=input_ids,
+                        )
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+            outputs = outputs.strip()
 
-        outputs = outputs.strip()
-        gt = q_dict['answer']
-        inf_res = {"video_path": video_path,
-                   "key":   q_dict['key'],
-                    "prompt": prompt,
-                    "pred": outputs,
-                    "gt": gt, 
-                    "task_type": q_dict['question_type'],
-                    "model_id": model_name}
-        # print(inf_res)
-        ans_file.write(json.dumps(inf_res) + "\n")
+            outputs = outputs.strip()
+            gt = q_dict['answer']
+            inf_res = {"video_path": video_path,
+                       "key":   q_dict['key'],
+                        "prompt": prompt,
+                        "pred": outputs,
+                        "gt": gt, 
+                        "task_type": q_dict['question_type'],
+                        "model_id": model_name}
+            # print(inf_res)
+            ans_file.write(json.dumps(inf_res) + "\n")
 
-        ans_file.flush()
+            ans_file.flush()
+        finally:
+            # Drop refs before the next long video (K=32+K_r=32 → 64-frame SDPA).
+            video = None
+            videos = None
+            input_ids = None
+            output_ids = None
+            _teardown_qa_cuda(model)
 
     ans_file.close()
 
