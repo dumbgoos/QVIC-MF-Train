@@ -657,6 +657,39 @@ class QViCMetaMixin:
                 self.frame_indices_memory = torch.cat([self.frame_indices_memory[:, :index_remove], self.frame_indices_memory[:, index_remove + 1:]], dim=1)
                 self.reflection_frequency = torch.cat([self.reflection_frequency[:, :index_remove], self.reflection_frequency[:, index_remove + 1:]], dim=1)
 
+    def _remove_relevance_tracking_entry(self, index_remove):
+        """Drop one K_r tracking entry without touching HTM/MF context_memory.
+
+        HTM owns ``context_memory`` via write/materialize; MF K_r recall still needs
+        ``relevance_memory`` / ``frame_indices_memory`` capped at L.
+        """
+        assert self.relevance_memory is not None and self.frame_indices_memory is not None
+        assert index_remove < self.relevance_memory.shape[1], (
+            f"index_remove {index_remove} is out of range for relevance_memory "
+            f"with shape {self.relevance_memory.shape}"
+        )
+        if index_remove == 0:
+            self.relevance_memory = self.relevance_memory[:, 1:]
+            self.frame_indices_memory = self.frame_indices_memory[:, 1:]
+            if self.reflection_frequency is not None:
+                self.reflection_frequency = self.reflection_frequency[:, 1:]
+        elif index_remove == self.relevance_memory.shape[1] - 1:
+            self.relevance_memory = self.relevance_memory[:, :-1]
+            self.frame_indices_memory = self.frame_indices_memory[:, :-1]
+            if self.reflection_frequency is not None:
+                self.reflection_frequency = self.reflection_frequency[:, :-1]
+        else:
+            self.relevance_memory = torch.cat(
+                [self.relevance_memory[:, :index_remove], self.relevance_memory[:, index_remove + 1:]], dim=1
+            )
+            self.frame_indices_memory = torch.cat(
+                [self.frame_indices_memory[:, :index_remove], self.frame_indices_memory[:, index_remove + 1:]], dim=1
+            )
+            if self.reflection_frequency is not None:
+                self.reflection_frequency = torch.cat(
+                    [self.reflection_frequency[:, :index_remove], self.reflection_frequency[:, index_remove + 1:]], dim=1
+                )
+
     def embed_video_streaming(  # Asynchronous encoding with a SemLock, only for videos, batch size > 1
             self,
             images,  # B x [T, C, H, W]
@@ -714,6 +747,10 @@ class QViCMetaMixin:
                         # -- Memory-feedback retrieval
                         # paper: eq.(1)
                         assert not self.training
+                        assert self.relevance_memory is not None and self.frame_indices_memory is not None, (
+                            "compress_with_relevance=True requires relevance_memory after the first clip; "
+                            "HTM write path must maintain K_r tracking buffers"
+                        )
                         assert self.relevance_memory.shape[1] == self.frame_indices_memory.shape[1]
                         top_indices = torch.argsort(self.relevance_memory[0], descending=True).tolist()
                         num_recall_frames = min(self.context_condition_frame_num, len(top_indices))
@@ -887,6 +924,34 @@ class QViCMetaMixin:
                         # Keep compression_size aligned for any legacy callers (token units ≈ 1 each).
                         B_h, T_h, _, _ = self.context_memory.shape
                         self.compression_size = torch.ones(B_h, T_h, device=self.context_memory.device)
+                        # #@HTM — K_r read path is orthogonal to HTM write: still track
+                        # per-clip-frame relevance + original frame indices for recall/feedback.
+                        # Do not call remove_target_frame_on_memory (that would desync HTM tokens).
+                        if self.compress_with_relevance:
+                            B_rel = context_embeds.shape[0]
+                            for i_frame in range(context_embeds.shape[1]):
+                                relevance = relevances_outputs[:, i_frame:i_frame + 1].to(self.device)  # [B, 1]
+                                frame_idx = (
+                                    torch.tensor([start_idx + i_frame], dtype=torch.float32, device=self.device)
+                                    .unsqueeze(0)
+                                    .expand(B_rel, -1)
+                                )  # [B, 1]
+                                freq_constant = torch.zeros(B_rel, 1, device=self.device)
+                                if self.relevance_memory is None:
+                                    self.relevance_memory = relevance
+                                    self.frame_indices_memory = frame_idx
+                                    self.reflection_frequency = freq_constant
+                                    relevance_memory_long = relevance  # debug
+                                else:
+                                    self.relevance_memory = torch.cat([self.relevance_memory, relevance], dim=1)
+                                    self.frame_indices_memory = torch.cat([self.frame_indices_memory, frame_idx], dim=1)
+                                    self.reflection_frequency = torch.cat(
+                                        [self.reflection_frequency, freq_constant], dim=1
+                                    )
+                                    relevance_memory_long = torch.cat([relevance_memory_long, relevance], dim=1)
+                                if self.relevance_memory.shape[1] > self.context_memory_length:
+                                    index_min_relevance = torch.argmin(self.relevance_memory[0]).item()
+                                    self._remove_relevance_tracking_entry(index_min_relevance)
                     else:
                         for i_frame in range(context_embeds.shape[1]):
                             B, _, _, _ = context_embeds.shape
