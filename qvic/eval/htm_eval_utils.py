@@ -54,20 +54,27 @@ def apply_htm_eval_runtime(
 
     model.set_htm_stage_a(bool(htm_stage_a))
     model.set_use_htm(True)
-    # Training/eval write-path fair compare: K_r=0 (caller should also pass
-    # --compress_with_relevance False).
+    # K_r / compress_with_relevance is caller-controlled (False = write-fair;
+    # True = paper-matched read feedback). Do not force it here.
     model.fill_context_memory = False
 
     ctrl = getattr(model, "htm_controller", None)
+    kr_on = bool(getattr(model, "compress_with_relevance", False))
+    kr_label = "on" if kr_on else "off"
     if ctrl is not None:
         if context_memory_length is not None:
             ctrl.L = int(context_memory_length)
         if hasattr(ctrl, "thresholds") and hasattr(ctrl.thresholds, "quantile"):
+            # Quantile alone is inert until write_batch feeds S_t/D_t (must keep
+            # collect_threshold_stats=True at eval — see qvic_meta_mixin HTM write).
             ctrl.thresholds.quantile = float(htm_quantile)
         rank0_print(
             f"[HTM] eval runtime: stage_a={htm_stage_a} L={getattr(ctrl, 'L', '?')} "
-            f"quantile={htm_quantile} K_r=off (compress_with_relevance caller-controlled)"
+            f"quantile={htm_quantile} K_r={kr_label} (compress_with_relevance={kr_on})"
         )
     else:
-        rank0_print(f"[HTM] eval runtime: stage_a={htm_stage_a} (no controller?)")
+        rank0_print(
+            f"[HTM] eval runtime: stage_a={htm_stage_a} K_r={kr_label} "
+            f"(compress_with_relevance={kr_on}; no controller?)"
+        )
     return True

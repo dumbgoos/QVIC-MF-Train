@@ -657,6 +657,39 @@ class QViCMetaMixin:
                 self.frame_indices_memory = torch.cat([self.frame_indices_memory[:, :index_remove], self.frame_indices_memory[:, index_remove + 1:]], dim=1)
                 self.reflection_frequency = torch.cat([self.reflection_frequency[:, :index_remove], self.reflection_frequency[:, index_remove + 1:]], dim=1)
 
+    def _remove_relevance_tracking_entry(self, index_remove):
+        """Drop one K_r tracking entry without touching HTM/MF context_memory.
+
+        HTM owns ``context_memory`` via write/materialize; MF K_r recall still needs
+        ``relevance_memory`` / ``frame_indices_memory`` capped at L.
+        """
+        assert self.relevance_memory is not None and self.frame_indices_memory is not None
+        assert index_remove < self.relevance_memory.shape[1], (
+            f"index_remove {index_remove} is out of range for relevance_memory "
+            f"with shape {self.relevance_memory.shape}"
+        )
+        if index_remove == 0:
+            self.relevance_memory = self.relevance_memory[:, 1:]
+            self.frame_indices_memory = self.frame_indices_memory[:, 1:]
+            if self.reflection_frequency is not None:
+                self.reflection_frequency = self.reflection_frequency[:, 1:]
+        elif index_remove == self.relevance_memory.shape[1] - 1:
+            self.relevance_memory = self.relevance_memory[:, :-1]
+            self.frame_indices_memory = self.frame_indices_memory[:, :-1]
+            if self.reflection_frequency is not None:
+                self.reflection_frequency = self.reflection_frequency[:, :-1]
+        else:
+            self.relevance_memory = torch.cat(
+                [self.relevance_memory[:, :index_remove], self.relevance_memory[:, index_remove + 1:]], dim=1
+            )
+            self.frame_indices_memory = torch.cat(
+                [self.frame_indices_memory[:, :index_remove], self.frame_indices_memory[:, index_remove + 1:]], dim=1
+            )
+            if self.reflection_frequency is not None:
+                self.reflection_frequency = torch.cat(
+                    [self.reflection_frequency[:, :index_remove], self.reflection_frequency[:, index_remove + 1:]], dim=1
+                )
+
     def embed_video_streaming(  # Asynchronous encoding with a SemLock, only for videos, batch size > 1
             self,
             images,  # B x [T, C, H, W]
@@ -714,6 +747,10 @@ class QViCMetaMixin:
                         # -- Memory-feedback retrieval
                         # paper: eq.(1)
                         assert not self.training
+                        assert self.relevance_memory is not None and self.frame_indices_memory is not None, (
+                            "compress_with_relevance=True requires relevance_memory after the first clip; "
+                            "HTM write path must maintain K_r tracking buffers"
+                        )
                         assert self.relevance_memory.shape[1] == self.frame_indices_memory.shape[1]
                         top_indices = torch.argsort(self.relevance_memory[0], descending=True).tolist()
                         num_recall_frames = min(self.context_condition_frame_num, len(top_indices))
@@ -837,6 +874,9 @@ class QViCMetaMixin:
                                 relevances.append(relevance_batch)  # B x [T]
 
                         relevances_outputs = torch.stack(relevances, dim=0)  # [B, T]
+                        # Free full-layer attention maps ASAP (64-frame K_r clips are multi-GiB).
+                        del output_attentions, relevances
+                        encoder_outputs = None
 
                     # Extract the part corresponding to the clip (excluding the recalled frames)
                     if self.compress_with_relevance and (num_frame_clip < self.max_frame_num_encoder) and recall_memory_indices is not None:
@@ -871,10 +911,13 @@ class QViCMetaMixin:
                         ctx_for_htm = context_embeds.detach() if self.htm_stage_a else context_embeds
                         for i_frame in range(ctx_for_htm.shape[1]):
                             context_embed = ctx_for_htm[:, i_frame:i_frame + 1]  # [B, 1, C, D]
+                            # Always adapt τ_s/τ_d online (train + eval). Gating on
+                            # self.training froze τ=1.0 at QA eval and diverged from
+                            # Stage A/B stats (collect_threshold_stats=True → merge~40%).
                             step_loss = self.htm_controller.write_batch(
                                 context_embed,
                                 self.htm_predictor,
-                                collect_threshold_stats=bool(self.training),
+                                collect_threshold_stats=True,
                             )
                             if step_loss is not None:
                                 if getattr(self, "_htm_pred_loss_sum", None) is None:
@@ -884,9 +927,42 @@ class QViCMetaMixin:
                                     self._htm_pred_loss_sum = self._htm_pred_loss_sum + step_loss
                                     self._htm_pred_steps = int(self._htm_pred_steps) + 1
                         self.context_memory = self.htm_controller.materialize_context_memory(ctx_for_htm)
+                        # Snapshot before prepare_inputs clear_memory (needed for HTM_EVAL_LOG_TAU).
+                        try:
+                            self._htm_last_eval_stats = self.htm_controller.snapshot_eval_write_stats(0)
+                        except Exception:
+                            self._htm_last_eval_stats = None
                         # Keep compression_size aligned for any legacy callers (token units ≈ 1 each).
                         B_h, T_h, _, _ = self.context_memory.shape
                         self.compression_size = torch.ones(B_h, T_h, device=self.context_memory.device)
+                        # #@HTM — K_r read path is orthogonal to HTM write: still track
+                        # per-clip-frame relevance + original frame indices for recall/feedback.
+                        # Do not call remove_target_frame_on_memory (that would desync HTM tokens).
+                        if self.compress_with_relevance:
+                            B_rel = context_embeds.shape[0]
+                            for i_frame in range(context_embeds.shape[1]):
+                                relevance = relevances_outputs[:, i_frame:i_frame + 1].to(self.device)  # [B, 1]
+                                frame_idx = (
+                                    torch.tensor([start_idx + i_frame], dtype=torch.float32, device=self.device)
+                                    .unsqueeze(0)
+                                    .expand(B_rel, -1)
+                                )  # [B, 1]
+                                freq_constant = torch.zeros(B_rel, 1, device=self.device)
+                                if self.relevance_memory is None:
+                                    self.relevance_memory = relevance
+                                    self.frame_indices_memory = frame_idx
+                                    self.reflection_frequency = freq_constant
+                                    relevance_memory_long = relevance  # debug
+                                else:
+                                    self.relevance_memory = torch.cat([self.relevance_memory, relevance], dim=1)
+                                    self.frame_indices_memory = torch.cat([self.frame_indices_memory, frame_idx], dim=1)
+                                    self.reflection_frequency = torch.cat(
+                                        [self.reflection_frequency, freq_constant], dim=1
+                                    )
+                                    relevance_memory_long = torch.cat([relevance_memory_long, relevance], dim=1)
+                                if self.relevance_memory.shape[1] > self.context_memory_length:
+                                    index_min_relevance = torch.argmin(self.relevance_memory[0]).item()
+                                    self._remove_relevance_tracking_entry(index_min_relevance)
                     else:
                         for i_frame in range(context_embeds.shape[1]):
                             B, _, _, _ = context_embeds.shape
@@ -1077,7 +1153,11 @@ class QViCMetaMixin:
             if delete_tensor:
                 del self.frame_indices_memory
             self.frame_indices_memory = None
-        # #@HTM
+        if self.reflection_frequency is not None:
+            if delete_tensor:
+                del self.reflection_frequency
+            self.reflection_frequency = None
+        # #@HTM — drop event/recent token buffers so consecutive long videos do not retain peak VRAM
         if getattr(self, "htm_controller", None) is not None:
             self.htm_controller.states = []
         self.htm_pred_loss = None
