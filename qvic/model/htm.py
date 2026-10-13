@@ -124,10 +124,16 @@ class HTMMemoryController:
         gamma: float = 0.01,
         quantile: float = 0.9,  # #@HTM locked default
         event_representation: str = "pooled",
+        memory_layout: str = "legacy",
     ):
         if event_representation not in ("pooled", "tokens"):
             raise ValueError("event_representation must be pooled or tokens")
         self.event_representation = event_representation
+        if memory_layout not in ("legacy", "chronological", "frames"):
+            raise ValueError("Unknown HTM memory layout")
+        if memory_layout == "frames" and event_representation != "tokens":
+            raise ValueError("Frame baseline requires token representation")
+        self.memory_layout = memory_layout
         self.L = int(token_budget_L)
         self.W = int(recent_window_W)
         self.alpha = float(alpha)
@@ -206,7 +212,7 @@ class HTMMemoryController:
             self.thresholds.update(s=S_t, d=D_t)
 
         merge = False
-        if state.open_event is not None and state.c_hat is not None:
+        if self.memory_layout != "frames" and state.open_event is not None and state.c_hat is not None:
             if self.thresholds.ready():
                 merge = (S_t < self.thresholds.tau_s) and (D_t < self.thresholds.tau_d)
             else:
@@ -329,6 +335,8 @@ class HTMMemoryController:
         units: List[Dict] = []
         # Recent raw clips (each costs C).
         for i, clip in enumerate(state.recent):
+            if self.memory_layout == "frames":
+                break  # Each original frame already has one event; avoid duplication.
             units.append({
                 "kind": "recent",
                 "tokens": clip,  # [C, D]
@@ -336,6 +344,7 @@ class HTMMemoryController:
                 "S": float(state.open_event.S) if state.open_event is not None else 0.0,
                 "R": 0.0,
                 "age": float(state.age_counter - i),
+                "time": (state.recent_t[i], state.recent_t[i], 1),
             })
         # Closed events + open event, charging their actual token count.
         all_events = list(state.events)
@@ -350,6 +359,7 @@ class HTMMemoryController:
                 "S": float(ev.S),
                 "R": 0.0,
                 "age": float(len(all_events) - j),
+                "time": (ev.t_s, ev.t_e, 0),
             })
 
         total = sum(u["cost"] for u in units)
@@ -371,6 +381,10 @@ class HTMMemoryController:
 
         if not units:
             return torch.zeros(0, 0)
+        if self.memory_layout in ("chronological", "frames"):
+            # Sort only after eviction so chronological ablation preserves the
+            # same selected units, including overlap with recent raw frames.
+            units.sort(key=lambda u: u["time"])
         tokens = torch.cat([u["tokens"] for u in units], dim=0)  # [T, D]
         if tokens.shape[0] > self.L:
             tokens = tokens[: self.L]
@@ -422,4 +436,10 @@ class HTMMemoryController:
         for b, tok in enumerate(per):
             t = min(tok.shape[0], T)
             out[b, :t, 0] = tok[:t].to(dtype=reference.dtype, device=reference.device)
+        if self.memory_layout == "frames":
+            # Preserve native frame groups for decoder newline/grid insertion.
+            C = reference.shape[-2]
+            if T % C:
+                raise ValueError("Frame baseline needs a budget large enough for whole C-token frames")
+            out = out.reshape(B, T // C, C, D)
         return out

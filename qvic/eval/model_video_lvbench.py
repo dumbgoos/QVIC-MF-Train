@@ -105,6 +105,7 @@ def parse_args():
     parser.add_argument("--htm_token_budget", type=int, default=None,
                         help="Override HTM write-token budget independently of relevance memory capacity.")
     parser.add_argument("--htm_event_representation", choices=("pooled", "tokens"), default="pooled")
+    parser.add_argument("--htm_memory_layout", choices=("legacy", "chronological", "frames"), default="legacy")
     
     return parser.parse_args()
 
@@ -186,6 +187,7 @@ def run_inference(args):
         context_memory_length=context_memory_length,
         htm_token_budget=args.htm_token_budget,
         htm_event_representation=args.htm_event_representation,
+        htm_memory_layout=args.htm_memory_layout,
     )
 
     if '.jsonl' in args.question_fp:

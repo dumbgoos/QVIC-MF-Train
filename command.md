@@ -359,3 +359,54 @@ echo "ablation_out=$ABLATION_OUT"
 `$ABLATION_OUT/ablation_report.json` 和 `ablation_exit`。
 当前为 10 步模型、16 题、每视频均匀采样 64 帧，只能观察表示敏感性，
 不能视作完整 LVBench 或训练后最终效果。
+
+======
+
+## 帧级不合并基线与事件时间排序消融
+
+三组都使用 tokens 表示、4096 写入上限、256 relevance 帧容量：
+`tokens_legacy_4096` 保持 recent→events 排列；
+`tokens_chronological_4096` 在相同记忆选择完成后按时间排序；
+`frames_4096` 不合并，每帧保留 16 tokens，按时间排列，移除 recent 重复条目。
+64 帧的帧级基线应有 1024 tokens。事件组的实际长度较短，比较还涉及重复条目，
+因此帧级结果不能单独归因于跨帧平均。时间排序组保留重复条目以隔离排序因素。
+帧级基线输出原生 `[B, frames, C, D]` 分组，事件组继续使用扁平
+`[B, tokens, 1, D]`；decoder 的 grid/frame 换行插入也受这一形状影响。
+因此帧级对照包含分组恢复，实际 decoder 序列长度还包含换行 tokens。
+
+```bash
+conda activate video
+cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
+git fetch origin
+git checkout fix/htm-gradient-diagnostics
+git pull --ff-only
+python scripts/tools/test_htm_memory_layout.py
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=0
+RUN_DIR=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_b_2xh100/gradient_smoke_20261013_134226
+FULL_QA=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_full.jsonl
+VIDEO_DIR=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/video/all_videos
+STRUCTURE_OUT="$RUN_DIR/structure_ablation_$(date +%Y%m%d_%H%M%S)"
+
+mkdir -p logs/htm_checks
+set -o pipefail
+python scripts/tools/check_htm_event_ablation.py \
+  --checkpoint "$RUN_DIR/checkpoint-10" \
+  --questions "$FULL_QA" \
+  --video-dir "$VIDEO_DIR" \
+  --outdir "$STRUCTURE_OUT" \
+  --ablation structure \
+  --num-questions 16 --seed 42 --frames 64 --feedback on \
+  2>&1 | tee logs/htm_checks/structure_ablation.log
+STRUCTURE_EXIT=${PIPESTATUS[0]}
+echo "structure_exit=$STRUCTURE_EXIT"
+echo "structure_out=$STRUCTURE_OUT"
+```
+
+保持 full 标注和媒体可用性不变，应随机抽到上次相同的 16 题。
+预期三个推理组完成；两个事件组的合并次数和记忆长度相同，帧级组
+`n_merges=0` 且实际记忆为 1024 tokens。
+请回传 `structure_ablation.log`、`$STRUCTURE_OUT/selection.json`、
+`$STRUCTURE_OUT/ablation_report.json` 和 `structure_exit`。
+当前 checkpoint 仅训练 10 步，这组仍是诊断，不用于判断最终准确率。

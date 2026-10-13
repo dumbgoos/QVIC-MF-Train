@@ -20,6 +20,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--frames", type=int, default=64)
     parser.add_argument("--feedback", choices=("on", "off"), default="on")
+    parser.add_argument("--ablation", choices=("representation", "structure"), default="representation")
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     try:
@@ -39,15 +40,19 @@ def main() -> int:
         subset = out / "questions.jsonl"
         subset.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in selected))
         (out / "selection.json").write_text(json.dumps({"seed": args.seed, "source": str(args.questions), "selected": selected}, indent=2, ensure_ascii=False) + "\n")
-        variants = {"pooled_256": ("pooled", 256), "tokens_256": ("tokens", 256), "tokens_4096": ("tokens", 4096)}
+        variants = {"pooled_256": ("pooled", 256, "legacy"), "tokens_256": ("tokens", 256, "legacy"), "tokens_4096": ("tokens", 4096, "legacy")}
+        if args.ablation == "structure":
+            variants = {"tokens_legacy_4096": ("tokens", 4096, "legacy"),
+                        "tokens_chronological_4096": ("tokens", 4096, "chronological"),
+                        "frames_4096": ("tokens", 4096, "frames")}
         runs, summary = {}, {}
-        for name, (representation, budget) in variants.items():
+        for name, (representation, budget, layout) in variants.items():
             command = [sys.executable, "-u", str(ROOT / "scripts/tools/check_htm_checkpoint_inference.py"),
                        "--checkpoint", str(args.checkpoint.resolve()), "--questions", str(subset),
                        "--video-dir", str(args.video_dir.resolve()), "--outdir", str(out / name),
                        "--num-questions", str(len(selected)), "--frames", str(args.frames),
                        "--feedback", args.feedback, "--memory-tokens", str(budget),
-                       "--event-representation", representation]
+                       "--event-representation", representation, "--memory-layout", layout]
             if args.prepare_only:
                 command.append("--prepare-only")
             print(f"RUN {name}", flush=True)
@@ -60,15 +65,18 @@ def main() -> int:
                 report = json.loads((out / name / "report.json").read_text())
                 summary[name] = {"score": report["score"], "event_representation": representation,
                                  "write_budget": budget, "relevance_memory_entries": 256,
+                                 "memory_layout": layout,
                                  "mean_memory_tokens": sum(r["memory_tokens"] for r in runs[name].values()) / len(selected)}
         if args.prepare_only:
             print(f"PREPARED ONLY: {out}")
             return 0
         per_question = {key: {name: runs[name][key] for name in variants} for key in runs["pooled_256"]}
+        event_variants = [name for name, (_, _, layout) in variants.items() if layout != "frames"]
         report = {"complete": True, "checkpoint": str(args.checkpoint), "frames": args.frames, "seed": args.seed,
+                  "ablation": args.ablation,
                   "summary": summary, "per_question": per_question,
-                  "merge_counts_equal": all(len({r["n_merges"] for r in observations.values()}) == 1 for observations in per_question.values()),
-                  "note": "Inference representation/budget ablation, with relevance capacity fixed at 256. Token events still average across frames. Small subset and 64-frame uniform sampling do not measure full LVBench accuracy; checkpoint training is unchanged."}
+                  "merge_counts_equal": all(len({observations[name]["n_merges"] for name in event_variants}) == 1 for observations in per_question.values()),
+                  "note": "Relevance capacity fixed at 256. Chronological events sort retained units by start/end time and retain overlap with recent frames. Frame baseline disables merges and recent duplication. Actual decoder lengths differ. Small subset/64-frame sampling is diagnostic; checkpoint training is unchanged."}
         (out / "ablation_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         print(json.dumps(summary, indent=2))
         print(f"COMPLETE: {out / 'ablation_report.json'}")

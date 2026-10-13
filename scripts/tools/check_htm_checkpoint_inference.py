@@ -57,6 +57,7 @@ def main() -> int:
     parser.add_argument("--feedback", choices=("on", "off"), default="on")
     parser.add_argument("--memory-tokens", type=int, default=256)
     parser.add_argument("--event-representation", choices=("pooled", "tokens"), default="pooled")
+    parser.add_argument("--memory-layout", choices=("legacy", "chronological", "frames"), default="legacy")
     parser.add_argument("--quantile", type=float, default=0.9)
     parser.add_argument("--prepare-only", action="store_true", help="Validate paths and write input/command without loading the model")
     args = parser.parse_args()
@@ -82,6 +83,7 @@ def main() -> int:
                    "--force_sample", "True", "--video_fps", "1",
                    "--context_memory_length", "256", "--htm_token_budget", str(args.memory_tokens),
                    "--htm_event_representation", args.event_representation,
+                   "--htm_memory_layout", args.memory_layout,
                    "--context_condition_frame_num", "32", "--compress_with_relevance", str(args.feedback == "on"),
                    "--htm_stage_a", "False", "--htm_quantile", str(args.quantile),
                    "--torch_dtype", "bfloat16", "--set_verbose", "False"]
@@ -116,6 +118,7 @@ def main() -> int:
             "predictor_loaded": bool(re.search(r"loaded 6 htm_predictor tensors", log_text)),
             "htm_runtime_active": "[HTM] eval runtime: stage_a=False" in log_text,
             "requested_event_representation_active": f"event_representation={args.event_representation}" in log_text,
+            "requested_memory_layout_active": f"memory_layout={args.memory_layout}" in log_text,
             "all_selected_questions_predicted_once": len(actual) == len(expected) and set(actual) == set(expected),
             "nonempty_valid_predictions": bool(predictions) and all(str(r.get("pred", "")).strip() and scorer.normalize_letter(r.get("pred")) in "ABCD" for r in predictions),
             "ground_truth_matches_subset": all(r.get("gt") == expected.get(r.get("key"), {}).get("answer") for r in predictions),
@@ -123,6 +126,7 @@ def main() -> int:
         }
         report = {"checkpoint": str(args.checkpoint.resolve()), "feedback": args.feedback,
                   "event_representation": args.event_representation, "relevance_memory_entries": 256,
+                  "memory_layout": args.memory_layout,
                   "frames": args.frames, "memory_tokens": args.memory_tokens, "exit_code": exit_code,
                   "checks": checks, "passed": all(checks.values()),
                   "score": scorer.score(predictions), "note": "Loading/inference smoke only; tiny uniformly sampled subset cannot measure accuracy recovery."}

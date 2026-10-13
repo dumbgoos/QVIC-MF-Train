@@ -40,6 +40,7 @@ def apply_htm_eval_runtime(
     context_memory_length: int | None = None,
     htm_token_budget: int | None = None,
     htm_event_representation: str = "pooled",
+    htm_memory_layout: str = "legacy",
 ) -> bool:
     """Finish HTM runtime knobs after ``load_pretrained_model``.
 
@@ -73,6 +74,11 @@ def apply_htm_eval_runtime(
         if htm_event_representation not in ("pooled", "tokens"):
             raise ValueError("Unknown HTM event representation")
         ctrl.event_representation = htm_event_representation
+        if htm_memory_layout not in ("legacy", "chronological", "frames"):
+            raise ValueError("Unknown HTM memory layout")
+        if htm_memory_layout == "frames" and htm_event_representation != "tokens":
+            raise ValueError("Frame baseline requires token representation")
+        ctrl.memory_layout = htm_memory_layout
         if hasattr(ctrl, "thresholds") and hasattr(ctrl.thresholds, "quantile"):
             # Quantile alone is inert until write_batch feeds S_t/D_t (must keep
             # collect_threshold_stats=True at eval — see qvic_meta_mixin HTM write).
@@ -80,7 +86,7 @@ def apply_htm_eval_runtime(
         rank0_print(
             f"[HTM] eval runtime: stage_a={htm_stage_a} L={getattr(ctrl, 'L', '?')} "
             f"quantile={htm_quantile} K_r={kr_label} (compress_with_relevance={kr_on}) "
-            f"event_representation={htm_event_representation}"
+            f"event_representation={htm_event_representation} memory_layout={htm_memory_layout}"
         )
     else:
         rank0_print(
