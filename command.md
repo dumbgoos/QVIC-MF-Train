@@ -410,3 +410,32 @@ echo "structure_out=$STRUCTURE_OUT"
 请回传 `structure_ablation.log`、`$STRUCTURE_OUT/selection.json`、
 `$STRUCTURE_OUT/ablation_report.json` 和 `structure_exit`。
 当前 checkpoint 仅训练 10 步，这组仍是诊断，不用于判断最终准确率。
+
+======
+
+## 修复结构消融汇总错误：直接汇总已有结果
+
+三组 GPU 推理已完成。最后的 `ERROR: 'pooled_256'` 是汇总代码引用了错误组名。
+以下命令仅读取已保存的 report/predictions/日志，不加载模型，不需要 GPU。
+它会重建顶层 `ablation_report.json`，不会重跑推理。
+
+```bash
+git pull --ff-only
+python scripts/tools/test_htm_ablation_summary.py
+
+# 在原终端直接复用 STRUCTURE_OUT；新终端需设置为上次打印的 structure_out。
+: "${STRUCTURE_OUT:?请先设置 STRUCTURE_OUT 为上次结构消融的实际输出目录}"
+mkdir -p logs/htm_checks
+set -o pipefail
+python scripts/tools/check_htm_event_ablation.py \
+  --outdir "$STRUCTURE_OUT" \
+  --ablation structure \
+  --summarize-only \
+  2>&1 | tee logs/htm_checks/structure_summary.log
+SUMMARY_EXIT=${PIPESTATUS[0]}
+echo "summary_exit=$SUMMARY_EXIT"
+echo "structure_out=$STRUCTURE_OUT"
+```
+
+成功时输出 COMPLETE，退出码为 0。请回传 `$STRUCTURE_OUT/ablation_report.json`，
+若失败则回传 `structure_summary.log` 和 `summary_exit`。
