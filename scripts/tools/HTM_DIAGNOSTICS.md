@@ -69,8 +69,13 @@ retain the old behavior. This increases training graph memory; validate GPU
 memory on a small run before a long job. Discrete merge/eviction decisions remain
 outside QA autograd, so the predictor still learns from prediction loss.
 
-The default budget, event pooling, eviction priorities, ordering, and threshold
-lifetime are unchanged. Fixing gradients cannot repair an existing checkpoint;
+The default budget, event pooling, eviction priorities, and ordering are unchanged.
+Evaluation now resets threshold history for each new video/question; training
+keeps rolling threshold history. `check_htm_policy.py` reports the controller's
+default reset behavior, which intentionally retains training history. Run
+`python scripts/tools/test_htm_eval_threshold_reset.py` to check the eval reset
+and synthetic order independence. This inference fix applies to existing
+checkpoints, but fixing gradients cannot repair their past training;
 validate and retrain Stage B before drawing accuracy conclusions.
 
 ## Local validation

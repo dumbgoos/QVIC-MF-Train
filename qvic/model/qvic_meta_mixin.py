@@ -903,7 +903,9 @@ class QViCMetaMixin:
                         if (not self.htm_controller.states) or (
                             reset_memory and i_clip == 0 and self.context_memory is None
                         ):
-                            self.htm_controller.reset(context_embeds.shape[0])
+                            self.htm_controller.reset(
+                                context_embeds.shape[0], reset_thresholds=not self.training
+                            )
                             self.htm_pred_loss = None
                             self._htm_pred_loss_sum = None
                             self._htm_pred_steps = 0

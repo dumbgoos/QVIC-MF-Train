@@ -266,3 +266,48 @@ PASS: all three groups have stored parameter changes
 
 若显示 `UNCHANGED`、`MISSING` 或 `NONFINITE`，需要继续排查。
 请回传 `checkpoint_updates.log`、`checkpoint_updates.json` 和 `compare_exit`。
+
+======
+
+## 阈值跨视频状态修复后，重跑相同随机题目的顺序检查
+
+评估新视频/题目开始时清空阈值历史；训练仍保留滚动历史。
+使用相同 full 标注、checkpoint 和 seed=42，保持数据文件及媒体目录不变，
+应再次抽到 `JlrzSvCsIjE_4004` 和 `5dZ_lvDgevk_914`。
+
+```bash
+conda activate video
+cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
+git fetch origin
+git checkout fix/htm-gradient-diagnostics
+git pull --ff-only
+
+python scripts/tools/test_htm_eval_threshold_reset.py
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=0
+RUN_DIR=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_b_2xh100/gradient_smoke_20261013_134226
+FULL_QA=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_full.jsonl
+VIDEO_DIR=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/video/all_videos
+ORDER_OUT="$RUN_DIR/order_reset_diag_$(date +%Y%m%d_%H%M%S)"
+
+mkdir -p logs/htm_checks
+set -o pipefail
+python scripts/tools/check_htm_question_order.py \
+  --checkpoint "$RUN_DIR/checkpoint-10" \
+  --questions "$FULL_QA" \
+  --video-dir "$VIDEO_DIR" \
+  --outdir "$ORDER_OUT" \
+  --seed 42 --frames 64 --feedback on \
+  2>&1 | tee logs/htm_checks/question_order_reset.log
+ORDER_EXIT=${PIPESTATUS[0]}
+echo "order_exit=$ORDER_EXIT"
+echo "order_out=$ORDER_OUT"
+```
+
+预期 CPU 测试打印两行 PASS；真实推理报告的
+`order_sensitive_logged_behavior` 为 false，各题相对 solo 的合并次数、
+记忆长度及 τ 差值均为 0。若仍有差异，继续排查其他状态或数值非确定性。
+两题答对与否不作为本项通过条件。
+请回传 `question_order_reset.log`、`$ORDER_OUT/selection.json`、
+`$ORDER_OUT/order_report.json` 和 `order_exit`。

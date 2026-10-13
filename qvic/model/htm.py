@@ -138,7 +138,15 @@ class HTMMemoryController:
         self._eval_sum_D = 0.0
         self._eval_n_D = 0
 
-    def reset(self, batch_size: int) -> None:
+    def reset(self, batch_size: int, reset_thresholds: bool = False) -> None:
+        if reset_thresholds:
+            # Evaluation questions are independent streams. Preserve the
+            # configured quantile/window, but discard scores from prior videos.
+            self.thresholds = QuantileThresholds(
+                quantile=self.thresholds.quantile,
+                maxlen=self.thresholds._s.maxlen,
+                warmup=self.thresholds.warmup,
+            )
         self.states = [HTMSampleState(recent=deque(maxlen=self.W), recent_t=deque(maxlen=self.W))
                        for _ in range(batch_size)]
         self._eval_n_steps = 0
