@@ -111,7 +111,7 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export CUDA_VISIBLE_DEVICES=0
 
 RUN_DIR=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_b_2xh100/gradient_smoke_20261013_134226
-SLICE=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_tau128.jsonl
+SLICE=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_smoke16.jsonl
 VIDEO_DIR=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/video/all_videos
 INFER_OUT="$RUN_DIR/inference_smoke_$(date +%Y%m%d_%H%M%S)"
 
@@ -148,6 +148,43 @@ cat "$INFER_OUT/report.json"
 如需验证关闭 feedback 的路径，使用新的输出目录并将 `--feedback on` 改为
 `--feedback off`。不要复用已有输出目录，脚本会拒绝覆盖先前诊断文件。
 本机只验证了输入准备和脚本语法；真实 checkpoint 加载及 GPU 推理需由训练机运行。
+
+======
+
+## 使用现有 smoke16 标注重跑推理验证
+
+之前的 `lvbench_qa_tau128.jsonl` 不存在，改用已确认的 smoke16 文件。
+脚本仍只选择两题。激活 `video` 环境并进入仓库根目录后执行：
+
+```bash
+git pull --ff-only
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=0
+
+RUN_DIR=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_b_2xh100/gradient_smoke_20261013_134226
+SLICE=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_smoke16.jsonl
+VIDEO_DIR=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/video/all_videos
+INFER_OUT="$RUN_DIR/inference_smoke_$(date +%Y%m%d_%H%M%S)"
+
+mkdir -p logs/htm_checks
+set -o pipefail
+python scripts/tools/check_htm_checkpoint_inference.py \
+  --checkpoint "$RUN_DIR/checkpoint-10" \
+  --questions "$SLICE" \
+  --video-dir "$VIDEO_DIR" \
+  --outdir "$INFER_OUT" \
+  --num-questions 2 \
+  --frames 64 \
+  --feedback on \
+  2>&1 | tee logs/htm_checks/checkpoint_inference.log
+INFER_EXIT=${PIPESTATUS[0]}
+echo "inference_exit=$INFER_EXIT"
+echo "inference_out=$INFER_OUT"
+cat "$INFER_OUT/report.json"
+```
+
+请回传 `checkpoint_inference.log`、`$INFER_OUT/report.json`、
+`$INFER_OUT/predictions.json` 和 `inference_exit`。
 检查不要求每个张量都变化。参数变化不能单独证明 QA 梯度来源或准确率恢复；
 低精度舍入也可能使小更新在保存权重中不可见。
 
