@@ -58,6 +58,7 @@ def main() -> int:
     ap.add_argument("--context-tokens", type=int, default=16, help="C")
     ap.add_argument("--memory-length", type=int, default=16, help="L (>= K to exercise the interpolation)")
     ap.add_argument("--model-base", default="lmms-lab/LLaVA-Video-7B-Qwen2")
+    ap.add_argument("--htm", action="store_true", help="Check Stage B HTM through the real compressor and decoder.")
     args = ap.parse_args()
 
     torch.manual_seed(0)
@@ -100,6 +101,10 @@ def main() -> int:
     model.compress_with_relevance = False   # training: one-way, K_r = 0
     model.fill_context_memory = True
     model.train_qvic_freeze_encoder = False
+    if args.htm:
+        model.initialize_htm(hidden_size=32, recent_window_W=2)
+        model.set_htm_stage_a(False)
+        model.fill_context_memory = False
 
     print("== applying LoRA to the compressor only ==")
     from peft import LoraConfig, get_peft_model
@@ -109,12 +114,12 @@ def main() -> int:
                                              bias="none", target_modules=target,
                                              task_type="CAUSAL_LM"))
     for name, param in model.named_parameters():
-        if "context_embed" in name:
+        if "context_embed" in name or (args.htm and "htm_predictor" in name):
             param.requires_grad = True
 
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
     assert any("context_embed" in n for n in trainable), "context seed embedding is frozen"
-    assert all("lora_" in n or "context_embed" in n for n in trainable), \
+    assert all("lora_" in n or "context_embed" in n or (args.htm and "htm_predictor" in n) for n in trainable), \
         f"unexpected trainable params: {[n for n in trainable if 'lora_' not in n and 'context_embed' not in n]}"
     assert not any(n.startswith("base_model.model.model.layers") and "lora_" in n for n in trainable), \
         "LoRA leaked into the decoder"
@@ -145,14 +150,16 @@ def main() -> int:
     print(f"   loss = {loss.item():.4f}")
     assert torch.isfinite(loss), "loss is not finite"
 
-    # The memory bank must hold K frames of C context tokens, then be stretched
-    # to a random length in [K, L] by fill_context_memory.
+    # MF stretches frame entries; HTM materializes a flat token-budget memory.
     base = model.get_base_model()
     mem = base.memory_for_each_batch
     print(f"   context memory: {tuple(mem.shape)}  (K={args.frames}, C={args.context_tokens}, L={args.memory_length})")
-    assert mem.shape[0] == 1 and mem.shape[2] == args.context_tokens
-    assert args.frames <= mem.shape[1] <= args.memory_length, \
-        f"effective memory length {mem.shape[1]} outside [{args.frames}, {args.memory_length}]"
+    assert mem.shape[0] == 1
+    if args.htm:
+        assert mem.shape[2] == 1 and 0 < mem.shape[1] <= args.memory_length
+    else:
+        assert mem.shape[2] == args.context_tokens
+        assert args.frames <= mem.shape[1] <= args.memory_length
 
     print("== backward ==")
     loss.backward()
@@ -167,6 +174,10 @@ def main() -> int:
           f"max |grad LoRA| = {lora_grad_norm:.3e}")
     assert ce_grad.norm().item() > 0, "context seed embedding received a zero gradient"
     assert lora_grad_norm > 0, "no LoRA parameter received a gradient"
+    if args.htm:
+        pred_norm = max(g.norm().item() for n, g in grads.items() if "htm_predictor" in n)
+        assert pred_norm > 0, "predictor received no nonzero gradient"
+        print(f"   max |grad predictor| = {pred_norm:.3e}")
 
     print("== checkpoint ==")
     with tempfile.TemporaryDirectory() as tmp:
@@ -186,7 +197,10 @@ def main() -> int:
                           ("ctx_attn_mask_type", "framewise")):
             assert conf.get(key) == want, f"config.json[{key}] = {conf.get(key)!r}, expected {want!r}"
         non_lora = torch.load(os.path.join(tmp, "non_lora_trainables.bin"), map_location="cpu")
-        assert list(non_lora) == ["base_model.model.context_embed.weight"], list(non_lora)
+        assert "base_model.model.context_embed.weight" in non_lora
+        assert all("context_embed" in k or (args.htm and "htm_predictor" in k) for k in non_lora)
+        if args.htm:
+            assert any("htm_predictor" in k for k in non_lora)
         lora_sd = torch.load(os.path.join(tmp, "adapter_model.bin"), map_location="cpu")
         assert lora_sd and all("encoder." in k for k in lora_sd), \
             f"LoRA weights outside the compressor: {[k for k in lora_sd if 'encoder.' not in k][:3]}"

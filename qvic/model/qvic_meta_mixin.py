@@ -918,6 +918,7 @@ class QViCMetaMixin:
                                 context_embed,
                                 self.htm_predictor,
                                 collect_threshold_stats=True,
+                                retain_memory_grad=self.training and not self.htm_stage_a,
                             )
                             if step_loss is not None:
                                 if getattr(self, "_htm_pred_loss_sum", None) is None:

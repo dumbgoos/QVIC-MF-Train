@@ -163,10 +163,14 @@ class HTMMemoryController:
         predictor: HTMPredictor,
         collect_threshold_stats: bool,
         step_stats: Optional[List[Dict]] = None,  # #@HTM
+        retain_memory_grad: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Advance one sample by one clip. Returns (c_bar detached, pred_loss or None)."""
         c_bar = c_tokens.mean(dim=0)  # [D]
         c_bar_det = c_bar.detach()
+        # Stage B QA supervision must reach the compressor through readable
+        # memory. Predictor targets and discrete routing remain stop-gradient.
+        c_memory = c_bar if retain_memory_grad else c_bar_det
         pred_loss: Optional[torch.Tensor] = None
         S_t = 0.0
         has_pred = state.c_hat is not None
@@ -196,13 +200,13 @@ class HTMMemoryController:
         action = "open"
         if state.open_event is None:
             state.open_event = HTMEvent(
-                z=c_bar_det.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1
+                z=c_memory.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1
             )
             action = "open"
         elif merge:
             ev = state.open_event
             n = ev.n
-            ev.z = (n * ev.z + c_bar_det) / (n + 1)
+            ev.z = (n * ev.z + c_memory) / (n + 1)
             ev.n = n + 1
             ev.t_e = state.t
             ev.S = max(ev.S, S_t)  # max aggregate (design §11)
@@ -210,7 +214,7 @@ class HTMMemoryController:
         else:
             state.events.append(state.open_event)
             state.open_event = HTMEvent(
-                z=c_bar_det.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1
+                z=c_memory.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1
             )
             action = "new_event"
 
@@ -226,7 +230,7 @@ class HTMMemoryController:
             self._eval_n_D += 1
 
         # Recent window keeps raw C tokens.
-        state.recent.append(c_tokens.detach())
+        state.recent.append(c_tokens if retain_memory_grad else c_tokens.detach())
         state.recent_t.append(state.t)
 
         # Predictor update (grads flow into GRU / proj). Detach h for truncated BPTT-1.
@@ -348,6 +352,7 @@ class HTMMemoryController:
         context_frames: torch.Tensor,  # [B, 1, C, D]
         predictor: HTMPredictor,
         collect_threshold_stats: bool,
+        retain_memory_grad: bool = False,
     ) -> Optional[torch.Tensor]:
         """Write one frame/clip for a batch. Returns mean pred loss or None."""
         # #@HTM — late-attached GRU is not covered by HF device_map="auto" and
@@ -362,7 +367,8 @@ class HTMMemoryController:
         for b in range(B):
             c_tokens = context_frames[b, 0]  # [C, D]
             _, loss_b = self.step_sample(
-                self.states[b], c_tokens, predictor, collect_threshold_stats
+                self.states[b], c_tokens, predictor, collect_threshold_stats,
+                retain_memory_grad=retain_memory_grad,
             )
             if loss_b is not None:
                 losses.append(loss_b)
