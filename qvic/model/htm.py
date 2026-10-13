@@ -93,6 +93,7 @@ class HTMEvent:
     t_e: int
     S: float
     n: int
+    tokens: Optional[torch.Tensor] = None  # [C, D], optional token-preserving ablation
 
 
 # #@HTM
@@ -122,7 +123,11 @@ class HTMMemoryController:
         beta: float = 0.0,
         gamma: float = 0.01,
         quantile: float = 0.9,  # #@HTM locked default
+        event_representation: str = "pooled",
     ):
+        if event_representation not in ("pooled", "tokens"):
+            raise ValueError("event_representation must be pooled or tokens")
+        self.event_representation = event_representation
         self.L = int(token_budget_L)
         self.W = int(recent_window_W)
         self.alpha = float(alpha)
@@ -179,6 +184,9 @@ class HTMMemoryController:
         # Stage B QA supervision must reach the compressor through readable
         # memory. Predictor targets and discrete routing remain stop-gradient.
         c_memory = c_bar if retain_memory_grad else c_bar_det
+        event_tokens = None
+        if self.event_representation == "tokens":
+            event_tokens = c_tokens if retain_memory_grad else c_tokens.detach()
         pred_loss: Optional[torch.Tensor] = None
         S_t = 0.0
         has_pred = state.c_hat is not None
@@ -208,13 +216,16 @@ class HTMMemoryController:
         action = "open"
         if state.open_event is None:
             state.open_event = HTMEvent(
-                z=c_memory.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1
+                z=c_memory.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1,
+                tokens=event_tokens.clone() if event_tokens is not None else None,
             )
             action = "open"
         elif merge:
             ev = state.open_event
             n = ev.n
             ev.z = (n * ev.z + c_memory) / (n + 1)
+            if event_tokens is not None:
+                ev.tokens = (n * ev.tokens + event_tokens) / (n + 1)
             ev.n = n + 1
             ev.t_e = state.t
             ev.S = max(ev.S, S_t)  # max aggregate (design §11)
@@ -222,7 +233,8 @@ class HTMMemoryController:
         else:
             state.events.append(state.open_event)
             state.open_event = HTMEvent(
-                z=c_memory.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1
+                z=c_memory.clone(), t_s=state.t, t_e=state.t, S=S_t, n=1,
+                tokens=event_tokens.clone() if event_tokens is not None else None,
             )
             action = "new_event"
 
@@ -288,10 +300,11 @@ class HTMMemoryController:
 
     # #@HTM
     def memory_composition(self, state: HTMSampleState) -> Dict:
-        """Token-budget accounting for Stage A stats (|M| = recent·C + events·1)."""
+        """Count raw recent and event tokens before and after budget eviction."""
         recent_raw_tokens = int(sum(int(c.shape[0]) for c in state.recent))
         n_events = len(state.events) + (1 if state.open_event is not None else 0)
-        event_tokens = int(n_events)  # each event costs 1 context token
+        all_events = state.events + ([state.open_event] if state.open_event is not None else [])
+        event_tokens = sum(self._event_memory(ev).shape[0] for ev in all_events)
         mem = self.build_memory_tokens(state)
         final_M = int(mem.shape[0]) if mem.numel() else 0
         return {
@@ -304,8 +317,15 @@ class HTMMemoryController:
             "final_M_over_L": (final_M / self.L) if self.L > 0 else None,
         }
 
+    def _event_memory(self, event: HTMEvent) -> torch.Tensor:
+        if self.event_representation == "tokens":
+            if event.tokens is None:
+                raise RuntimeError("Token representation must be configured before writing a stream")
+            return event.tokens
+        return event.z.unsqueeze(0)
+
     def build_memory_tokens(self, state: HTMSampleState) -> torch.Tensor:
-        """Flat readable memory ``[T, D]`` with costs C (recent) vs 1 (event), ``T ≤ L``."""
+        """Flat readable memory ``[T, D]``, with event cost 1 or C, ``T ≤ L``."""
         units: List[Dict] = []
         # Recent raw clips (each costs C).
         for i, clip in enumerate(state.recent):
@@ -317,15 +337,16 @@ class HTMMemoryController:
                 "R": 0.0,
                 "age": float(state.age_counter - i),
             })
-        # Closed events + open event (each costs 1).
+        # Closed events + open event, charging their actual token count.
         all_events = list(state.events)
         if state.open_event is not None:
             all_events = all_events + [state.open_event]
         for j, ev in enumerate(all_events):
+            event_memory = self._event_memory(ev)
             units.append({
                 "kind": "event",
-                "tokens": ev.z.unsqueeze(0),  # [1, D]
-                "cost": 1,
+                "tokens": event_memory,
+                "cost": int(event_memory.shape[0]),
                 "S": float(ev.S),
                 "R": 0.0,
                 "age": float(len(all_events) - j),

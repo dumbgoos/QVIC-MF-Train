@@ -102,6 +102,9 @@ def parse_args():
                         help="True = Stage A (freeze-compressor write); False = Stage B joint (default).")
     parser.add_argument("--htm_quantile", type=float, default=0.9,
                         help="HTM merge quantile (locked Stage B eval default 0.9).")
+    parser.add_argument("--htm_token_budget", type=int, default=None,
+                        help="Override HTM write-token budget independently of relevance memory capacity.")
+    parser.add_argument("--htm_event_representation", choices=("pooled", "tokens"), default="pooled")
     
     return parser.parse_args()
 
@@ -181,6 +184,8 @@ def run_inference(args):
         htm_stage_a=args.htm_stage_a,
         htm_quantile=args.htm_quantile,
         context_memory_length=context_memory_length,
+        htm_token_budget=args.htm_token_budget,
+        htm_event_representation=args.htm_event_representation,
     )
 
     if '.jsonl' in args.question_fp:

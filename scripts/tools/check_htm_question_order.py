@@ -125,7 +125,7 @@ def main() -> int:
         comparisons = compare_orders(pair, runs)
         report = {"complete": True, "seed": args.seed, "comparisons": comparisons,
                   "order_sensitive_logged_behavior": any(r["logged_behavior_changed"] for r in comparisons.values()),
-                  "note": "Differences are diagnostic, not failures. Thresholds persist across questions; attribution requires a reset ablation. Tau logs are rounded to 4 decimals. This is not an accuracy evaluation."}
+                  "note": "Differences are diagnostic, not failures. Current eval resets threshold history per question. Tau logs are rounded to 4 decimals. This is not an accuracy evaluation."}
         (out / "order_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         print(json.dumps(report, indent=2, ensure_ascii=False))
         print(f"COMPLETE: order diagnostic saved to {out / 'order_report.json'}")

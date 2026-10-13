@@ -311,3 +311,51 @@ echo "order_out=$ORDER_OUT"
 两题答对与否不作为本项通过条件。
 请回传 `question_order_reset.log`、`$ORDER_OUT/selection.json`、
 `$ORDER_OUT/order_report.json` 和 `order_exit`。
+
+======
+
+## 事件 token 表示与写入预算消融
+
+顺序重置复测已通过。接下来在相同随机 16 题、相同 checkpoint、采样和
+feedback 下比较三组：pooled_256、tokens_256、tokens_4096。
+pooled 每个事件保留一个向量；tokens 对事件内各帧的相同 token 位置平均，
+保留 C=16 的结构。三组 relevance 记忆容量均固定为 256 个帧条目，
+4096 仅是 HTM 写入 token 上限。这是无需重新训练的推理消融。
+
+```bash
+conda activate video
+cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
+git fetch origin
+git checkout fix/htm-gradient-diagnostics
+git pull --ff-only
+python scripts/tools/test_htm_event_tokens.py
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=0
+RUN_DIR=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_b_2xh100/gradient_smoke_20261013_134226
+FULL_QA=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_full.jsonl
+VIDEO_DIR=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/video/all_videos
+ABLATION_OUT="$RUN_DIR/event_ablation_$(date +%Y%m%d_%H%M%S)"
+
+mkdir -p logs/htm_checks
+set -o pipefail
+python scripts/tools/check_htm_event_ablation.py \
+  --checkpoint "$RUN_DIR/checkpoint-10" \
+  --questions "$FULL_QA" \
+  --video-dir "$VIDEO_DIR" \
+  --outdir "$ABLATION_OUT" \
+  --num-questions 16 --seed 42 --frames 64 --feedback on \
+  2>&1 | tee logs/htm_checks/event_ablation.log
+ABLATION_EXIT=${PIPESTATUS[0]}
+echo "ablation_exit=$ABLATION_EXIT"
+echo "ablation_out=$ABLATION_OUT"
+```
+
+预期三个推理组均通过加载检查，最后输出 COMPLETE，
+`ablation_report.json` 包含每组得分、平均记忆长度和逐题比较。
+预计合并次数一致，因为 predictor 和 gating 仍使用相同 pooled 特征；
+表示与预算影响的是 decoder 记忆内容及预算淘汰。
+请回传 `event_ablation.log`、`$ABLATION_OUT/selection.json`、
+`$ABLATION_OUT/ablation_report.json` 和 `ablation_exit`。
+当前为 10 步模型、16 题、每视频均匀采样 64 帧，只能观察表示敏感性，
+不能视作完整 LVBench 或训练后最终效果。

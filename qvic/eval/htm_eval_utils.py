@@ -38,6 +38,8 @@ def apply_htm_eval_runtime(
     htm_stage_a: bool = False,
     htm_quantile: float = 0.9,
     context_memory_length: int | None = None,
+    htm_token_budget: int | None = None,
+    htm_event_representation: str = "pooled",
 ) -> bool:
     """Finish HTM runtime knobs after ``load_pretrained_model``.
 
@@ -64,13 +66,21 @@ def apply_htm_eval_runtime(
     if ctrl is not None:
         if context_memory_length is not None:
             ctrl.L = int(context_memory_length)
+        if htm_token_budget is not None:
+            if htm_token_budget <= 0:
+                raise ValueError("HTM token budget must be positive")
+            ctrl.L = int(htm_token_budget)
+        if htm_event_representation not in ("pooled", "tokens"):
+            raise ValueError("Unknown HTM event representation")
+        ctrl.event_representation = htm_event_representation
         if hasattr(ctrl, "thresholds") and hasattr(ctrl.thresholds, "quantile"):
             # Quantile alone is inert until write_batch feeds S_t/D_t (must keep
             # collect_threshold_stats=True at eval — see qvic_meta_mixin HTM write).
             ctrl.thresholds.quantile = float(htm_quantile)
         rank0_print(
             f"[HTM] eval runtime: stage_a={htm_stage_a} L={getattr(ctrl, 'L', '?')} "
-            f"quantile={htm_quantile} K_r={kr_label} (compress_with_relevance={kr_on})"
+            f"quantile={htm_quantile} K_r={kr_label} (compress_with_relevance={kr_on}) "
+            f"event_representation={htm_event_representation}"
         )
     else:
         rank0_print(
