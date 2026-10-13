@@ -598,8 +598,10 @@ echo "training_exit=$TRAIN_EXIT"
 两次推理使用同一份 seed=42 随机抽取的 16 道题，优先不同视频。
 这是 LVBench 独立推理诊断；未核查它与训练集的视频重叠，不能据此声称无泄漏泛化。
 评估不覆盖 checkpoint 配置，以检查保存的 tokens/4096/chronological/grouped 设置。
+整段在子 shell 内运行；检查失败只结束子 shell，保留交互终端。
 
 ```bash
+(
 conda activate video
 cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
 git pull --ff-only
@@ -671,9 +673,63 @@ if predictions[25].keys() != predictions[50].keys():
 print("PASS: both reload/inference runs; inspect inference.log HTM telemetry before full training")
 print("Artifacts:", root)
 PY
+)
 ```
 
 请回传 checkpoint_updates.json、两份 report.json 和 inference.log 中的 `[HTM τ]` 行。
 参数更新和重载检查通过、没有非有限值或异常记忆坍缩后，可使用上一节的
 MODE=full RESUME=0 命令，从 Stage A predictor 开始新目录全量训练。
 16 题准确率用于诊断，不设必须上涨的门槛，也不作为最终准确率结论。
+
+======
+
+## pilot 验收推理失败后的重试（保留终端和错误日志）
+
+前两项已 PASS 时无需重复检查。重新打开 session 后激活环境，下面自动复用
+最近 acceptance 目录的 questions.jsonl，并打印所选路径。每次使用新的推理
+输出目录，避免已有诊断文件触发拒绝覆盖。所有 exit 均在括号子 shell 内。
+
+```bash
+conda activate video
+cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
+git pull --ff-only
+(
+set -o pipefail
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0
+export PILOT_DIR=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_tokens_pilot_20261013_160959
+VIDEO_DIR=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/video/all_videos
+QUESTIONS=$(python - <<'PY'
+import os
+from pathlib import Path
+paths = list(Path(os.environ["PILOT_DIR"]).glob("acceptance_*/questions.jsonl"))
+if not paths:
+    raise SystemExit("ERROR: no prepared acceptance questions.jsonl found")
+print(max(paths, key=lambda path: path.stat().st_mtime))
+PY
+) || exit $?
+RETRY_OUT="$PILOT_DIR/inference_retry_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RETRY_OUT" || exit $?
+echo "questions=$QUESTIONS"
+echo "retry_out=$RETRY_OUT"
+for STEP in 25 50; do
+  python -u scripts/tools/check_htm_checkpoint_inference.py \
+    --checkpoint "$PILOT_DIR/checkpoint-$STEP" \
+    --questions "$QUESTIONS" \
+    --video-dir "$VIDEO_DIR" \
+    --outdir "$RETRY_OUT/checkpoint-$STEP" \
+    --num-questions 16 --frames 64 --feedback on \
+    2>&1 | tee "$RETRY_OUT/checkpoint-$STEP.driver.log"
+  RUN_EXIT=$?
+  echo "checkpoint-$STEP exit=$RUN_EXIT"
+  if [ "$RUN_EXIT" -ne 0 ]; then
+    echo "推理失败，错误日志：$RETRY_OUT/checkpoint-$STEP.driver.log"
+    tail -80 "$RETRY_OUT/checkpoint-$STEP.driver.log"
+    exit "$RUN_EXIT"
+  fi
+done
+echo "PASS: both inference checks; reports under $RETRY_OUT"
+)
+```
+
+若仍失败，回传 driver.log 最后 80 行（包含 ERROR/Traceback）及打印的退出码。
+当前尚不能从 session 退出判断是路径、依赖、显存还是 checkpoint 加载问题。
