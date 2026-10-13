@@ -185,6 +185,48 @@ cat "$INFER_OUT/report.json"
 
 请回传 `checkpoint_inference.log`、`$INFER_OUT/report.json`、
 `$INFER_OUT/predictions.json` 和 `inference_exit`。
+
+======
+
+## 从 full LVBench 随机抽题检查推理顺序敏感性
+
+脚本按固定种子从已有视频的题目中随机抽取两题，要求来自不同视频。
+依次在独立模型进程中运行单题 A、单题 B、A→B、B→A；每次用相同
+checkpoint、帧采样、memory 预算和 feedback 设置。完整推理需一张 GPU。
+
+```bash
+conda activate video
+cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
+git fetch origin
+git checkout fix/htm-gradient-diagnostics
+git pull --ff-only
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=0
+RUN_DIR=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_b_2xh100/gradient_smoke_20261013_134226
+FULL_QA=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_full.jsonl
+VIDEO_DIR=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/video/all_videos
+ORDER_OUT="$RUN_DIR/order_diag_$(date +%Y%m%d_%H%M%S)"
+
+mkdir -p logs/htm_checks
+set -o pipefail
+python scripts/tools/check_htm_question_order.py \
+  --checkpoint "$RUN_DIR/checkpoint-10" \
+  --questions "$FULL_QA" \
+  --video-dir "$VIDEO_DIR" \
+  --outdir "$ORDER_OUT" \
+  --seed 42 --frames 64 --feedback on \
+  2>&1 | tee logs/htm_checks/question_order.log
+ORDER_EXIT=${PIPESTATUS[0]}
+echo "order_exit=$ORDER_EXIT"
+echo "order_out=$ORDER_OUT"
+```
+
+成功后 `order_report.json` 汇总同一题在单题、正序和反序下的答案、
+合并次数、最终记忆 token 数以及 τ 阈值。差异是诊断结果，不会使脚本失败。
+请回传 `question_order.log`、`$ORDER_OUT/selection.json`、
+`$ORDER_OUT/order_report.json` 和 `order_exit`。每次输出目录必须是新的。
+这项检查使用 10 步 checkpoint 与每视频 64 帧，仅用于观察顺序敏感性。
 检查不要求每个张量都变化。参数变化不能单独证明 QA 梯度来源或准确率恢复；
 低精度舍入也可能使小更新在保存权重中不可见。
 
