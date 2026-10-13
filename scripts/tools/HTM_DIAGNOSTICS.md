@@ -91,3 +91,24 @@ pooling had already reduced the representation below either cap.
 The full-model check, GPU execution, pinned PyTorch 2.5.1 environment, and
 LVBench accuracy were not validated locally. CPU diagnostics establish controller
 behavior; they do not establish accuracy recovery for the trained model.
+
+## Grouped Stage B recipe
+
+`scripts/train/train_htm_stage_b_tokens_2xh100.sh` implements the accepted
+tokens/4096 recipe with chronological units and native C-token decoder groups.
+It reuses the existing Stage A predictor, then jointly trains compressor LoRA,
+context seed, and predictor. This recipe resets thresholds per video during
+both training and evaluation; the legacy training default still retains rolling
+history. The default mode is a 128-record/100-step pilot before a full epoch.
+
+HTM representation, budget, grouping, reset mode, predictor hidden size, window,
+and quantile are saved in config.json and restored by the builder. The inference
+check uses these defaults automatically; explicit ablations can override them.
+QA/prediction loss and memory statistics are logged as `_local` rank-local
+microbatch means. They are not distributed averages like Trainer's total loss.
+
+`test_htm_grouped_config.py` checks initialization, configuration restoration,
+grouped gradients, and real grid newline logic without VLM imports.
+`test_htm_loss_metrics.py` checks the actual loss block and Trainer metric
+accumulation. Full-model grouped CPU and actual GPU pilot checks still need
+the training machine. All training commands are recorded in command.md.

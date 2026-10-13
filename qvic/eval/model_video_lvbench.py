@@ -104,8 +104,9 @@ def parse_args():
                         help="HTM merge quantile (locked Stage B eval default 0.9).")
     parser.add_argument("--htm_token_budget", type=int, default=None,
                         help="Override HTM write-token budget independently of relevance memory capacity.")
-    parser.add_argument("--htm_event_representation", choices=("pooled", "tokens"), default="pooled")
-    parser.add_argument("--htm_memory_layout", choices=("legacy", "chronological", "frames"), default="legacy")
+    parser.add_argument("--htm_event_representation", choices=("pooled", "tokens"), default=None)
+    parser.add_argument("--htm_memory_layout", choices=("legacy", "chronological", "frames"), default=None)
+    parser.add_argument("--htm_group_tokens", type=lambda x: str(x).lower() == 'true', default=None)
     
     return parser.parse_args()
 
@@ -188,6 +189,7 @@ def run_inference(args):
         htm_token_budget=args.htm_token_budget,
         htm_event_representation=args.htm_event_representation,
         htm_memory_layout=args.htm_memory_layout,
+        htm_group_tokens=args.htm_group_tokens,
     )
 
     if '.jsonl' in args.question_fp:

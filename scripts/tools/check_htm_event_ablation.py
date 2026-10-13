@@ -106,7 +106,7 @@ def main() -> int:
                        "--video-dir", str(args.video_dir.resolve()), "--outdir", str(out / name),
                        "--num-questions", str(len(selected)), "--frames", str(args.frames),
                        "--feedback", args.feedback, "--memory-tokens", str(budget),
-                       "--event-representation", representation, "--memory-layout", layout]
+                       "--event-representation", representation, "--memory-layout", layout, "--no-group-tokens"]
             if args.prepare_only:
                 command.append("--prepare-only")
             print(f"RUN {name}", flush=True)

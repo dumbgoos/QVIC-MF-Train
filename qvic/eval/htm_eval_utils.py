@@ -39,8 +39,9 @@ def apply_htm_eval_runtime(
     htm_quantile: float = 0.9,
     context_memory_length: int | None = None,
     htm_token_budget: int | None = None,
-    htm_event_representation: str = "pooled",
-    htm_memory_layout: str = "legacy",
+    htm_event_representation: str | None = None,
+    htm_memory_layout: str | None = None,
+    htm_group_tokens: bool | None = None,
 ) -> bool:
     """Finish HTM runtime knobs after ``load_pretrained_model``.
 
@@ -65,6 +66,12 @@ def apply_htm_eval_runtime(
     kr_on = bool(getattr(model, "compress_with_relevance", False))
     kr_label = "on" if kr_on else "off"
     if ctrl is not None:
+        config = getattr(model, "config", None)
+        htm_event_representation = htm_event_representation if htm_event_representation is not None else getattr(config, "htm_event_representation", "pooled")
+        htm_memory_layout = htm_memory_layout if htm_memory_layout is not None else getattr(config, "htm_memory_layout", "legacy")
+        htm_group_tokens = htm_group_tokens if htm_group_tokens is not None else getattr(config, "htm_group_tokens", False)
+        if htm_token_budget is None:
+            htm_token_budget = getattr(config, "htm_token_budget", None)
         if context_memory_length is not None:
             ctrl.L = int(context_memory_length)
         if htm_token_budget is not None:
@@ -79,6 +86,12 @@ def apply_htm_eval_runtime(
         if htm_memory_layout == "frames" and htm_event_representation != "tokens":
             raise ValueError("Frame baseline requires token representation")
         ctrl.memory_layout = htm_memory_layout
+        if htm_group_tokens and htm_event_representation != "tokens":
+            raise ValueError("Grouped decoder memory requires token events")
+        C = getattr(config, "context_embed_tokens", 16)
+        if htm_group_tokens and (ctrl.L <= 0 or ctrl.L % C):
+            raise ValueError("Grouped HTM budget must be a positive multiple of C")
+        ctrl.group_tokens = bool(htm_group_tokens)
         if hasattr(ctrl, "thresholds") and hasattr(ctrl.thresholds, "quantile"):
             # Quantile alone is inert until write_batch feeds S_t/D_t (must keep
             # collect_threshold_stats=True at eval — see qvic_meta_mixin HTM write).
@@ -86,7 +99,7 @@ def apply_htm_eval_runtime(
         rank0_print(
             f"[HTM] eval runtime: stage_a={htm_stage_a} L={getattr(ctrl, 'L', '?')} "
             f"quantile={htm_quantile} K_r={kr_label} (compress_with_relevance={kr_on}) "
-            f"event_representation={htm_event_representation} memory_layout={htm_memory_layout}"
+            f"event_representation={htm_event_representation} memory_layout={htm_memory_layout} grouped={htm_group_tokens}"
         )
     else:
         rank0_print(

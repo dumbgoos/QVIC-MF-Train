@@ -59,7 +59,10 @@ def main() -> int:
     ap.add_argument("--memory-length", type=int, default=16, help="L (>= K to exercise the interpolation)")
     ap.add_argument("--model-base", default="lmms-lab/LLaVA-Video-7B-Qwen2")
     ap.add_argument("--htm", action="store_true", help="Check Stage B HTM through the real compressor and decoder.")
+    ap.add_argument("--htm-grouped", action="store_true", help="Use 16-token events and native decoder groups.")
     args = ap.parse_args()
+    if args.htm_grouped and not args.htm:
+        ap.error("--htm-grouped requires --htm")
 
     torch.manual_seed(0)
     torch.set_num_threads(min(8, os.cpu_count() or 8))
@@ -102,7 +105,12 @@ def main() -> int:
     model.fill_context_memory = True
     model.train_qvic_freeze_encoder = False
     if args.htm:
-        model.initialize_htm(hidden_size=32, recent_window_W=2)
+        model.initialize_htm(hidden_size=32, recent_window_W=2,
+                             token_budget=args.memory_length,
+                             event_representation="tokens" if args.htm_grouped else "pooled",
+                             memory_layout="chronological" if args.htm_grouped else "legacy",
+                             group_tokens=args.htm_grouped,
+                             reset_thresholds_per_video=args.htm_grouped)
         model.set_htm_stage_a(False)
         model.fill_context_memory = False
 
@@ -156,7 +164,8 @@ def main() -> int:
     print(f"   context memory: {tuple(mem.shape)}  (K={args.frames}, C={args.context_tokens}, L={args.memory_length})")
     assert mem.shape[0] == 1
     if args.htm:
-        assert mem.shape[2] == 1 and 0 < mem.shape[1] <= args.memory_length
+        assert mem.shape[2] == (args.context_tokens if args.htm_grouped else 1)
+        assert 0 < mem.shape[1] * mem.shape[2] <= args.memory_length
     else:
         assert mem.shape[2] == args.context_tokens
         assert args.frames <= mem.shape[1] <= args.memory_length
@@ -201,6 +210,9 @@ def main() -> int:
         assert all("context_embed" in k or (args.htm and "htm_predictor" in k) for k in non_lora)
         if args.htm:
             assert any("htm_predictor" in k for k in non_lora)
+            assert conf["htm_token_budget"] == args.memory_length
+            assert conf["htm_group_tokens"] == args.htm_grouped
+            assert conf["htm_event_representation"] == ("tokens" if args.htm_grouped else "pooled")
         lora_sd = torch.load(os.path.join(tmp, "adapter_model.bin"), map_location="cpu")
         assert lora_sd and all("encoder." in k for k in lora_sd), \
             f"LoRA weights outside the compressor: {[k for k in lora_sd if 'encoder.' not in k][:3]}"

@@ -120,19 +120,41 @@ class QViCMetaMixin:
         pass
 
     # #@HTM
-    def initialize_htm(self, hidden_size=None, recent_window_W=4, quantile=0.9):
+    def initialize_htm(self, hidden_size=None, recent_window_W=4, quantile=0.9,
+                       token_budget=None, event_representation=None, memory_layout=None,
+                       group_tokens=None, reset_thresholds_per_video=None):
         """Attach GRU predictor + online memory controller (write path)."""
         dim = self.get_model().config.hidden_size
         self.htm_predictor = HTMPredictor(dim=dim, hidden_size=hidden_size)
-        L = self.context_memory_length or getattr(self.config, "context_memory_length", 256)
+        L = token_budget if token_budget is not None else getattr(
+            self.config, "htm_token_budget", self.context_memory_length or getattr(self.config, "context_memory_length", 256)
+        )
+        event_representation = event_representation if event_representation is not None else getattr(self.config, "htm_event_representation", "pooled")
+        memory_layout = memory_layout if memory_layout is not None else getattr(self.config, "htm_memory_layout", "legacy")
+        group_tokens = group_tokens if group_tokens is not None else getattr(self.config, "htm_group_tokens", False)
+        self.htm_reset_thresholds_per_video = reset_thresholds_per_video if reset_thresholds_per_video is not None else getattr(self.config, "htm_reset_thresholds_per_video", False)
+        if group_tokens and (L <= 0 or L % self.context_embed_tokens):
+            raise ValueError("Grouped HTM budget must be a positive multiple of C")
         self.htm_recent_window = int(recent_window_W)
         self.htm_controller = HTMMemoryController(
             token_budget_L=L,
             recent_window_W=self.htm_recent_window,
             quantile=quantile,
+            event_representation=event_representation,
+            memory_layout=memory_layout,
+            group_tokens=group_tokens,
         )
+        self.config.htm_token_budget = int(L)
+        self.config.htm_event_representation = event_representation
+        self.config.htm_memory_layout = memory_layout
+        self.config.htm_group_tokens = bool(group_tokens)
+        self.config.htm_reset_thresholds_per_video = bool(self.htm_reset_thresholds_per_video)
+        self.config.htm_recent_window = self.htm_recent_window
+        self.config.htm_quantile = float(quantile)
+        self.config.htm_hidden_size = self.htm_predictor.hidden_size
         self.use_htm = True
-        rank0_print(f"[HTM] initialized predictor dim={dim}, L={L}, W={self.htm_recent_window}")
+        rank0_print(f"[HTM] initialized predictor dim={dim}, L={L}, W={self.htm_recent_window} "
+                    f"events={event_representation} layout={memory_layout} grouped={group_tokens}")
 
     # #@HTM
     def set_use_htm(self, use_htm):
@@ -904,7 +926,7 @@ class QViCMetaMixin:
                             reset_memory and i_clip == 0 and self.context_memory is None
                         ):
                             self.htm_controller.reset(
-                                context_embeds.shape[0], reset_thresholds=not self.training
+                                context_embeds.shape[0], reset_thresholds=(not self.training) or getattr(self, "htm_reset_thresholds_per_video", False)
                             )
                             self.htm_pred_loss = None
                             self._htm_pred_loss_sum = None

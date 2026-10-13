@@ -125,6 +125,7 @@ class HTMMemoryController:
         quantile: float = 0.9,  # #@HTM locked default
         event_representation: str = "pooled",
         memory_layout: str = "legacy",
+        group_tokens: bool = False,
     ):
         if event_representation not in ("pooled", "tokens"):
             raise ValueError("event_representation must be pooled or tokens")
@@ -134,6 +135,9 @@ class HTMMemoryController:
         if memory_layout == "frames" and event_representation != "tokens":
             raise ValueError("Frame baseline requires token representation")
         self.memory_layout = memory_layout
+        if group_tokens and event_representation != "tokens":
+            raise ValueError("Grouped decoder memory requires token events")
+        self.group_tokens = bool(group_tokens)
         self.L = int(token_budget_L)
         self.W = int(recent_window_W)
         self.alpha = float(alpha)
@@ -436,7 +440,7 @@ class HTMMemoryController:
         for b, tok in enumerate(per):
             t = min(tok.shape[0], T)
             out[b, :t, 0] = tok[:t].to(dtype=reference.dtype, device=reference.device)
-        if self.memory_layout == "frames":
+        if self.memory_layout == "frames" or self.group_tokens:
             # Preserve native frame groups for decoder newline/grid insertion.
             C = reference.shape[-2]
             if T % C:

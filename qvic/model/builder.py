@@ -184,7 +184,11 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             non_lora_trainables, has_htm = _normalize_qvic_non_lora_state_dict(non_lora_trainables)
             if has_htm and hasattr(model, "initialize_htm"):
                 # QUANTILE=0.9 locked default; eval may rebuild controller after set_context_memory_length.
-                model.initialize_htm(recent_window_W=4, quantile=0.9)
+                model.initialize_htm(
+                    hidden_size=getattr(cfg_pretrained, "htm_hidden_size", None),
+                    recent_window_W=getattr(cfg_pretrained, "htm_recent_window", 4),
+                    quantile=getattr(cfg_pretrained, "htm_quantile", 0.9),
+                )
                 model.set_use_htm(True)
                 rank0_print(f'(HTM) initialize_htm before non_lora load from {model_path}')
             if len(non_lora_trainables) == 0:

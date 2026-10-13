@@ -55,6 +55,11 @@ class ModelArguments:
         metadata={"help": "HTM Stage A: train predictor only; freeze compressor/VLM/LoRA; K_r may stay 0."},
     )
     htm_recent_window: int = field(default=4, metadata={"help": "HTM recent-clip window W (raw C tokens each)."})
+    htm_token_budget: int = field(default=-1, metadata={"help": "HTM write-token budget; negative uses context_memory_length."})
+    htm_event_representation: str = field(default="pooled")
+    htm_memory_layout: str = field(default="legacy")
+    htm_group_tokens: bool = field(default=False, metadata={"help": "Preserve C-token groups for decoder grid/frame newlines."})
+    htm_reset_thresholds_per_video: bool = field(default=False)
     htm_hidden_size: int = field(
         default=-1, metadata={"help": "GRU hidden size; <0 means use model hidden_size."},
     )
@@ -317,6 +322,11 @@ def build_model(model_args: ModelArguments, training_args: QViCTrainingArguments
             hidden_size=hidden,
             recent_window_W=model_args.htm_recent_window,
             quantile=model_args.htm_quantile,
+            token_budget=model_args.htm_token_budget if model_args.htm_token_budget >= 0 else model_args.context_memory_length,
+            event_representation=model_args.htm_event_representation,
+            memory_layout=model_args.htm_memory_layout,
+            group_tokens=model_args.htm_group_tokens,
+            reset_thresholds_per_video=model_args.htm_reset_thresholds_per_video,
         )
         model.set_use_htm(True)
         model.set_htm_stage_a(bool(model_args.htm_stage_a))

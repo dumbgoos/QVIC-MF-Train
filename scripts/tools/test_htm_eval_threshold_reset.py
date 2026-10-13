@@ -32,7 +32,9 @@ def main() -> None:
              and isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "htm_controller"]
     assert len(calls) == 1
     reset_flag = next(kw.value for kw in calls[0].keywords if kw.arg == "reset_thresholds")
-    assert ast.unparse(reset_flag) == "not self.training"
+    assert isinstance(reset_flag, ast.BoolOp) and isinstance(reset_flag.op, ast.Or)
+    assert ast.unparse(reset_flag.values[0]) == "not self.training"
+    assert "htm_reset_thresholds_per_video" in ast.unparse(reset_flag.values[1])
 
     torch.manual_seed(42)
     predictor = module.HTMPredictor(8, 8).eval()

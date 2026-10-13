@@ -99,6 +99,30 @@ class QViCTrainer(Trainer):
     def __init__(self, *args, lora_bias: str = "none", **kwargs):
         super().__init__(*args, **kwargs)
         self.lora_bias = lora_bias
+        self._htm_metric_sums = {}
+        self._htm_metric_counts = {}
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        if model.training:
+            for key in ("htm_qa_loss", "htm_prediction_loss", "htm_final_M", "htm_merge_rate"):
+                value = outputs.get(key)
+                if value is not None:
+                    value = value.detach().float()
+                    self._htm_metric_sums[key] = self._htm_metric_sums.get(key, 0.0) + value
+                    self._htm_metric_counts[key] = self._htm_metric_counts.get(key, 0) + 1
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs):
+        if "loss" in logs or "train_loss" in logs:
+            # These are local-rank microbatch means; label explicitly rather
+            # than conflating them with Trainer's distributed total loss.
+            logs = dict(logs)
+            for key, value in self._htm_metric_sums.items():
+                logs[key + "_local"] = float(value / self._htm_metric_counts[key])
+            self._htm_metric_sums.clear()
+            self._htm_metric_counts.clear()
+        return super().log(logs)
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False) -> None:
         output_dir = output_dir if output_dir is not None else self.args.output_dir

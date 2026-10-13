@@ -55,19 +55,25 @@ def main() -> int:
     parser.add_argument("--num-questions", type=int, default=2)
     parser.add_argument("--frames", type=int, default=64, help="Uniformly sampled frames per video, not full-video accuracy evaluation")
     parser.add_argument("--feedback", choices=("on", "off"), default="on")
-    parser.add_argument("--memory-tokens", type=int, default=256)
-    parser.add_argument("--event-representation", choices=("pooled", "tokens"), default="pooled")
-    parser.add_argument("--memory-layout", choices=("legacy", "chronological", "frames"), default="legacy")
+    parser.add_argument("--memory-tokens", type=int, default=None)
+    parser.add_argument("--event-representation", choices=("pooled", "tokens"), default=None)
+    parser.add_argument("--memory-layout", choices=("legacy", "chronological", "frames"), default=None)
+    parser.add_argument("--group-tokens", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--quantile", type=float, default=0.9)
     parser.add_argument("--prepare-only", action="store_true", help="Validate paths and write input/command without loading the model")
     args = parser.parse_args()
-    if min(args.num_questions, args.frames, args.memory_tokens) <= 0 or not 0 <= args.quantile <= 1:
+    if min(args.num_questions, args.frames) <= 0 or (args.memory_tokens is not None and args.memory_tokens <= 0) or not 0 <= args.quantile <= 1:
         parser.error("Counts must be positive and quantile must be in [0, 1]")
     args.outdir = args.outdir.resolve()
     try:
         for filename in ("config.json", "adapter_config.json", "adapter_model.bin", "non_lora_trainables.bin"):
             if not (args.checkpoint / filename).is_file():
                 raise ValueError(f"Missing checkpoint file: {args.checkpoint / filename}")
+        config = json.loads((args.checkpoint / "config.json").read_text())
+        args.memory_tokens = args.memory_tokens if args.memory_tokens is not None else config.get("htm_token_budget", 256)
+        args.event_representation = args.event_representation or config.get("htm_event_representation", "pooled")
+        args.memory_layout = args.memory_layout or config.get("htm_memory_layout", "legacy")
+        args.group_tokens = args.group_tokens if args.group_tokens is not None else config.get("htm_group_tokens", False)
         selected = select_rows(read_rows(args.questions), args.video_dir, args.num_questions)
         artifacts = ("questions.jsonl", "predictions.json", "inference.log", "report.json", "command.json")
         if any((args.outdir / name).exists() for name in artifacts):
@@ -84,6 +90,7 @@ def main() -> int:
                    "--context_memory_length", "256", "--htm_token_budget", str(args.memory_tokens),
                    "--htm_event_representation", args.event_representation,
                    "--htm_memory_layout", args.memory_layout,
+                   "--htm_group_tokens", str(args.group_tokens),
                    "--context_condition_frame_num", "32", "--compress_with_relevance", str(args.feedback == "on"),
                    "--htm_stage_a", "False", "--htm_quantile", str(args.quantile),
                    "--torch_dtype", "bfloat16", "--set_verbose", "False"]
@@ -119,6 +126,7 @@ def main() -> int:
             "htm_runtime_active": "[HTM] eval runtime: stage_a=False" in log_text,
             "requested_event_representation_active": f"event_representation={args.event_representation}" in log_text,
             "requested_memory_layout_active": f"memory_layout={args.memory_layout}" in log_text,
+            "requested_decoder_grouping_active": f"grouped={args.group_tokens}" in log_text,
             "all_selected_questions_predicted_once": len(actual) == len(expected) and set(actual) == set(expected),
             "nonempty_valid_predictions": bool(predictions) and all(str(r.get("pred", "")).strip() and scorer.normalize_letter(r.get("pred")) in "ABCD" for r in predictions),
             "ground_truth_matches_subset": all(r.get("gt") == expected.get(r.get("key"), {}).get("answer") for r in predictions),
@@ -127,6 +135,7 @@ def main() -> int:
         report = {"checkpoint": str(args.checkpoint.resolve()), "feedback": args.feedback,
                   "event_representation": args.event_representation, "relevance_memory_entries": 256,
                   "memory_layout": args.memory_layout,
+                  "group_tokens": args.group_tokens,
                   "frames": args.frames, "memory_tokens": args.memory_tokens, "exit_code": exit_code,
                   "checks": checks, "passed": all(checks.values()),
                   "score": scorer.score(predictions), "note": "Loading/inference smoke only; tiny uniformly sampled subset cannot measure accuracy recovery."}

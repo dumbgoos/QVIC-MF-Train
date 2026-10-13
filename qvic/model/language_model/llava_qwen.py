@@ -114,6 +114,15 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
                 return_dict=return_dict
             )
             # #@HTM — Stage A: L_pred (+ optional λ_lm * L_LM); Stage B: L_LM + λ L_pred
+            if self.training and getattr(self, "use_htm", False):
+                if outputs.loss is not None:
+                    outputs["htm_qa_loss"] = outputs.loss.detach()
+                if getattr(self, "htm_pred_loss", None) is not None:
+                    outputs["htm_prediction_loss"] = self.htm_pred_loss.detach()
+                stats = getattr(self, "_htm_last_eval_stats", None) or {}
+                for field in ("final_M", "merge_rate"):
+                    if stats.get(field) is not None:
+                        outputs["htm_" + field] = outputs.logits.new_tensor(float(stats[field]), dtype=torch.float32)
             if getattr(self, "use_htm", False) and getattr(self, "htm_pred_loss", None) is not None:
                 pred = self.htm_pred_loss
                 if getattr(self, "htm_stage_a", False):

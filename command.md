@@ -502,3 +502,90 @@ echo "training_exit=$TRAIN_EXIT"
 ```
 
 恢复日志应显示 resuming from checkpoint-*，而不是 starting from scratch。
+
+======
+
+## 已确认的新方案：复用 Stage A，16-token 事件先短训
+
+Stage A predictor 的输入/目标仍是每帧 16 context tokens 的平均向量，
+因此无需为存储方式变化重训 Stage A。新 Stage B 继续更新 predictor。
+新方案为 tokens/4096、chronological、grouped decoder memory，W=4、q=0.9、
+λ_pred=0.1；训练与评估均在每个新视频重置阈值。Compressor LoRA/context seed
+从头初始化；decoder、视觉编码器/projector 冻结。训练 K_r=0。
+
+这里替代前面的 pooled 全量启动方案。新 checkpoint 保存全部 HTM 配置，
+评估默认从 config.json 恢复。不要用旧的 pooled wrapper 开始这轮长训练。
+
+### 第一步：完整模型分组梯度检查
+
+```bash
+conda activate video
+cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
+git fetch origin
+git checkout fix/htm-gradient-diagnostics
+git pull --ff-only
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+mkdir -p logs/htm_checks
+set -o pipefail
+PYTHONPATH=. python scripts/train/selftest_train_cpu.py \
+  --htm --htm-grouped --memory-length 64 \
+  2>&1 | tee logs/htm_checks/grouped_gradients.log
+GRAD_EXIT=${PIPESTATUS[0]}
+echo "grouped_gradient_exit=$GRAD_EXIT"
+```
+
+预期 memory 的第三维为 16，seed、LoRA、predictor 梯度均非零，
+checkpoint 配置检查通过，最终 SELFTEST OK。通过后才做以下 GPU 短训。
+
+### 第二步：固定 128 records、100 步 GPU pilot
+
+pilot 用双 GPU、累积 4（全局 batch=8），在固定样本上重复训练以检查
+QA 可学习性；它与全量模式的累积 8 区分。每 25 步保存，共 4 个 checkpoint。
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+export HTM_INIT_CHECKPOINT=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_a_2xh100/checkpoint-5000
+export OUTPUT_DIR="/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_tokens_pilot_$(date +%Y%m%d_%H%M%S)"
+PILOT_LOG="logs/htm_checks/$(basename "$OUTPUT_DIR").log"
+set -o pipefail
+MODE=pilot RESUME=0 bash scripts/train/train_htm_stage_b_tokens_2xh100.sh \
+  2>&1 | tee "$PILOT_LOG"
+PILOT_EXIT=${PIPESTATUS[0]}
+echo "pilot_exit=$PILOT_EXIT"
+echo "pilot_dir=$OUTPUT_DIR"
+```
+
+日志应显示 tokens、4096、chronological、grouped=True，并加载 6 个
+Stage A predictor tensors。训练字典新增 htm_qa_loss_local、
+htm_prediction_loss_local、htm_final_M_local、htm_merge_rate_local。
+这些是日志所在 rank 的 microbatch 均值，区别于 Trainer 汇总的总 loss。
+请回传 grouped_gradients.log、完整 PILOT_LOG、pilot_dir/exit 和 launch_config.json。
+先确认 QA loss 趋势和 checkpoint-25→100 参数变化；短训 loss 不降时检查原因，
+不直接投入全量。短训过拟合不证明泛化或 LVBench 收益。
+
+### 第三步：pilot 确认后再启动全量
+
+全量仍从 Stage A predictor 和初始 compressor/seed 开始，使用新的输出目录。
+不要恢复 pilot 的优化器/调度器状态。全量为 1 epoch、全局 batch=16。
+
+```bash
+export OUTPUT_DIR="/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_tokens_full_$(date +%Y%m%d_%H%M%S)"
+FULL_LOG="logs/htm_checks/$(basename "$OUTPUT_DIR").log"
+set -o pipefail
+MODE=full RESUME=0 bash scripts/train/train_htm_stage_b_tokens_2xh100.sh \
+  2>&1 | tee "$FULL_LOG"
+TRAIN_EXIT=${PIPESTATUS[0]}
+echo "training_exit=$TRAIN_EXIT"
+echo "output_dir=$OUTPUT_DIR"
+```
+
+恢复全量需将 OUTPUT_DIR 设为这次的实际目录，并保留 MODE=full：
+
+```bash
+set -o pipefail
+MODE=full RESUME=1 bash scripts/train/train_htm_stage_b_tokens_2xh100.sh \
+  2>&1 | tee -a "logs/htm_checks/$(basename "$OUTPUT_DIR").log"
+TRAIN_EXIT=${PIPESTATUS[0]}
+echo "training_exit=$TRAIN_EXIT"
+```
