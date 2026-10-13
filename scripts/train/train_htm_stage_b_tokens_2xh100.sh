@@ -29,7 +29,16 @@ export HTM_RECENT_WINDOW=4 HTM_QUANTILE=0.9 HTM_LAMBDA=0.1
 export LR=1e-4 WARMUP_RATIO=0.03 WEIGHT_DECAY=0
 export LORA_R=64 LORA_ALPHA=16 LORA_DROPOUT=0.05
 export DS_CONFIG="$QVIC_ROOT/scripts/train/zero3.json"
-export MEDIA_BACKEND=shards QA_MODE=single REPORT_TO=none
+export MEDIA_BACKEND=shards QA_MODE=single
+if [[ "$MODE" = full ]]; then
+    export REPORT_TO="${REPORT_TO:-wandb}"
+else
+    export REPORT_TO="${REPORT_TO:-none}"
+fi
+export RUN_NAME="${RUN_NAME:-$(basename "$OUTPUT_DIR")}"
+if [[ "$REPORT_TO" = wandb ]]; then
+    export WANDB_PROJECT="${WANDB_PROJECT:-qvic-htm-stage-b}"
+fi
 export EXTRA_ARGS="--htm_token_budget 4096 --htm_event_representation tokens --htm_memory_layout chronological --htm_group_tokens True --htm_reset_thresholds_per_video True"
 if [[ "$MODE" = pilot ]]; then
     export MAX_RECORDS=128 GRAD_ACCUM=4 SAVE_STEPS=25 SAVE_TOTAL_LIMIT=4 LOGGING_STEPS=5
@@ -42,6 +51,7 @@ echo "Stage B tokens: mode=$MODE resume=$RESUME out=$OUTPUT_DIR"
 echo "C=16 write_budget=4096 relevance_capacity=256 chronological grouped=True reset_thresholds_per_video=True"
 echo "Stage A predictor=$HTM_INIT_CHECKPOINT; fresh compressor LoRA/context seed"
 echo "max_records=${MAX_RECORDS:-all} grad_accum=$GRAD_ACCUM extra_args=$EXTRA_ARGS"
+echo "report_to=$REPORT_TO run_name=$RUN_NAME wandb_project=${WANDB_PROJECT:-unset}"
 if [[ "${DRY_RUN:-0}" = 1 ]]; then
     echo "DRY RUN: training not started"; exit 0
 fi
@@ -66,7 +76,7 @@ if [[ "$RESUME" = 0 ]]; then
     "${QVIC_PY:-python}" - <<'PY'
 import json, os, subprocess
 from pathlib import Path
-keys = ("HTM_TOKENS_RUN_MODE", "OUTPUT_DIR", "HTM_INIT_CHECKPOINT", "MODEL_BASE", "DATASET_ROOT", "ANNOTATION_PATH", "NUM_GPUS", "BATCH_SIZE", "GRAD_ACCUM", "LR", "MAX_RECORDS", "EXTRA_ARGS", "DS_CONFIG", "SKIP_LIST_PATH")
+keys = ("HTM_TOKENS_RUN_MODE", "OUTPUT_DIR", "HTM_INIT_CHECKPOINT", "MODEL_BASE", "DATASET_ROOT", "ANNOTATION_PATH", "NUM_GPUS", "BATCH_SIZE", "GRAD_ACCUM", "LR", "MAX_RECORDS", "EXTRA_ARGS", "DS_CONFIG", "SKIP_LIST_PATH", "REPORT_TO", "RUN_NAME", "WANDB_PROJECT", "WANDB_ENTITY", "WANDB_MODE")
 config = {key: os.environ.get(key) for key in keys}
 config["git_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 (Path(os.environ["OUTPUT_DIR"]) / "launch_config.json").write_text(json.dumps(config, indent=2) + "\n")

@@ -733,3 +733,43 @@ echo "PASS: both inference checks; reports under $RETRY_OUT"
 
 若仍失败，回传 driver.log 最后 80 行（包含 ERROR/Traceback）及打印的退出码。
 当前尚不能从 session 退出判断是路径、依赖、显存还是 checkpoint 加载问题。
+
+======
+
+## 全量 Stage B 上报 W&B
+
+tokens wrapper 全量模式默认 REPORT_TO=wandb，pilot 默认 none；可显式覆盖。
+Trainer 将 loss、grad_norm、learning_rate 和四个 htm_*_local 指标一起上报。
+HTM 指标是日志 rank 的 microbatch 均值；总 loss 与它们的加权和不要求完全相等。
+下面只启动新的全量训练，复用 Stage A predictor，不恢复 pilot。
+
+```bash
+conda activate video
+cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
+git pull --ff-only
+python -c 'import wandb; print("wandb", wandb.__version__)'
+# 若上一行提示未安装，先在 video 环境运行：python -m pip install wandb
+# 尚未登录时执行；在交互提示输入 API key，不要写入命令或仓库：
+wandb login
+
+export CUDA_VISIBLE_DEVICES=0,1
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export HTM_INIT_CHECKPOINT=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_a_2xh100/checkpoint-5000
+export OUTPUT_DIR="/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_tokens_full_$(date +%Y%m%d_%H%M%S)"
+export REPORT_TO=wandb WANDB_PROJECT=qvic-htm-stage-b WANDB_MODE=online
+# 使用团队空间时，可另外设置 WANDB_ENTITY 为实际账号或团队名称。
+export RUN_NAME="$(basename "$OUTPUT_DIR")"
+mkdir -p logs/htm_checks
+FULL_LOG="logs/htm_checks/$RUN_NAME.log"
+(
+set -o pipefail
+MODE=full RESUME=0 bash scripts/train/train_htm_stage_b_tokens_2xh100.sh \
+  2>&1 | tee "$FULL_LOG"
+TRAIN_EXIT=$?
+echo "training_exit=$TRAIN_EXIT"
+echo "output_dir=$OUTPUT_DIR"
+)
+```
+
+启动日志应显示 report_to=wandb 及 W&B run 链接。HF 离线变量仅影响模型下载，
+W&B online 上报需要训练机器能访问 W&B。这里的命令不自动启动训练。
