@@ -130,10 +130,23 @@ class HTMMemoryController:
         self.gamma = float(gamma)
         self.thresholds = QuantileThresholds(quantile=quantile)
         self.states: List[HTMSampleState] = []
+        # Eval telemetry (survives clear_memory wiping ``states`` if snapshotted first).
+        self._eval_n_steps = 0
+        self._eval_n_merges = 0
+        self._eval_sum_S = 0.0
+        self._eval_n_S = 0
+        self._eval_sum_D = 0.0
+        self._eval_n_D = 0
 
     def reset(self, batch_size: int) -> None:
         self.states = [HTMSampleState(recent=deque(maxlen=self.W), recent_t=deque(maxlen=self.W))
                        for _ in range(batch_size)]
+        self._eval_n_steps = 0
+        self._eval_n_merges = 0
+        self._eval_sum_S = 0.0
+        self._eval_n_S = 0
+        self._eval_sum_D = 0.0
+        self._eval_n_D = 0
 
     def ensure_batch(self, batch_size: int) -> None:
         if len(self.states) != batch_size:
@@ -201,6 +214,17 @@ class HTMMemoryController:
             )
             action = "new_event"
 
+        # Cheap running counters for QA eval (HTM_EVAL_LOG_TAU); Stage A stats use step_stats.
+        self._eval_n_steps += 1
+        if action == "merge":
+            self._eval_n_merges += 1
+        if has_pred:
+            self._eval_sum_S += float(S_t)
+            self._eval_n_S += 1
+        if D_t != float("inf"):
+            self._eval_sum_D += float(D_t)
+            self._eval_n_D += 1
+
         # Recent window keeps raw C tokens.
         state.recent.append(c_tokens.detach())
         state.recent_t.append(state.t)
@@ -227,6 +251,28 @@ class HTMMemoryController:
                 "tau_d": self.thresholds.tau_d,
             })
         return c_bar_det, pred_loss
+
+    def snapshot_eval_write_stats(self, batch_idx: int = 0) -> Dict:
+        """merge_rate / |M| / τ after a full encode (call before clear_memory)."""
+        n_steps = int(self._eval_n_steps)
+        n_merges = int(self._eval_n_merges)
+        decidable = max(n_steps - 1, 1)
+        comp: Dict = {}
+        if self.states and 0 <= batch_idx < len(self.states):
+            comp = self.memory_composition(self.states[batch_idx])
+        return {
+            "n_steps": n_steps,
+            "n_merges": n_merges,
+            "merge_rate": n_merges / decidable,
+            "mean_S": (self._eval_sum_S / self._eval_n_S) if self._eval_n_S else None,
+            "mean_D": (self._eval_sum_D / self._eval_n_D) if self._eval_n_D else None,
+            "tau_s": float(self.thresholds.tau_s),
+            "tau_d": float(self.thresholds.tau_d),
+            "thresholds_ready": bool(self.thresholds.ready()),
+            "final_M": comp.get("final_M"),
+            "n_events": comp.get("n_events"),
+            "token_budget_L": comp.get("token_budget_L", self.L),
+        }
 
     # #@HTM
     def memory_composition(self, state: HTMSampleState) -> Dict:

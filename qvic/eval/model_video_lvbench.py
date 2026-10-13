@@ -271,6 +271,22 @@ def run_inference(args):
             ans_file.write(json.dumps(inf_res) + "\n")
 
             ans_file.flush()
+            # #@HTM — optional merge/|M|/τ log (set HTM_EVAL_LOG_TAU=1). Stats are
+            # snapshotted after write before clear_memory inside prepare_inputs.
+            if os.environ.get("HTM_EVAL_LOG_TAU", "").strip() in ("1", "true", "True", "yes"):
+                stats = getattr(model, "_htm_last_eval_stats", None)
+                if stats:
+                    print(
+                        f"[HTM τ] key={q_dict['key']} merge_rate={stats.get('merge_rate'):.4f} "
+                        f"n_merges={stats.get('n_merges')}/{stats.get('n_steps')} "
+                        f"|M|={stats.get('final_M')} L={stats.get('token_budget_L')} "
+                        f"tau_s={stats.get('tau_s'):.4f} tau_d={stats.get('tau_d'):.4f} "
+                        f"ready={stats.get('thresholds_ready')} "
+                        f"mean_S={stats.get('mean_S')} mean_D={stats.get('mean_D')}",
+                        flush=True,
+                    )
+                else:
+                    print(f"[HTM τ] key={q_dict['key']} (no snapshot)", flush=True)
         finally:
             # Drop refs before the next long video (K=32+K_r=32 → 64-frame SDPA).
             video = None

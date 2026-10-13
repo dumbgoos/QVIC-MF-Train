@@ -927,6 +927,11 @@ class QViCMetaMixin:
                                     self._htm_pred_loss_sum = self._htm_pred_loss_sum + step_loss
                                     self._htm_pred_steps = int(self._htm_pred_steps) + 1
                         self.context_memory = self.htm_controller.materialize_context_memory(ctx_for_htm)
+                        # Snapshot before prepare_inputs clear_memory (needed for HTM_EVAL_LOG_TAU).
+                        try:
+                            self._htm_last_eval_stats = self.htm_controller.snapshot_eval_write_stats(0)
+                        except Exception:
+                            self._htm_last_eval_stats = None
                         # Keep compression_size aligned for any legacy callers (token units ≈ 1 each).
                         B_h, T_h, _, _ = self.context_memory.shape
                         self.compression_size = torch.ones(B_h, T_h, device=self.context_memory.device)
