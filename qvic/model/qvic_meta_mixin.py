@@ -911,10 +911,13 @@ class QViCMetaMixin:
                         ctx_for_htm = context_embeds.detach() if self.htm_stage_a else context_embeds
                         for i_frame in range(ctx_for_htm.shape[1]):
                             context_embed = ctx_for_htm[:, i_frame:i_frame + 1]  # [B, 1, C, D]
+                            # Always adapt τ_s/τ_d online (train + eval). Gating on
+                            # self.training froze τ=1.0 at QA eval and diverged from
+                            # Stage A/B stats (collect_threshold_stats=True → merge~40%).
                             step_loss = self.htm_controller.write_batch(
                                 context_embed,
                                 self.htm_predictor,
-                                collect_threshold_stats=bool(self.training),
+                                collect_threshold_stats=True,
                             )
                             if step_loss is not None:
                                 if getattr(self, "_htm_pred_loss_sum", None) is None:

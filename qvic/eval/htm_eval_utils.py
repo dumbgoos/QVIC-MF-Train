@@ -65,6 +65,8 @@ def apply_htm_eval_runtime(
         if context_memory_length is not None:
             ctrl.L = int(context_memory_length)
         if hasattr(ctrl, "thresholds") and hasattr(ctrl.thresholds, "quantile"):
+            # Quantile alone is inert until write_batch feeds S_t/D_t (must keep
+            # collect_threshold_stats=True at eval — see qvic_meta_mixin HTM write).
             ctrl.thresholds.quantile = float(htm_quantile)
         rank0_print(
             f"[HTM] eval runtime: stage_a={htm_stage_a} L={getattr(ctrl, 'L', '?')} "
