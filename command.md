@@ -439,3 +439,66 @@ echo "structure_out=$STRUCTURE_OUT"
 
 成功时输出 COMPLETE，退出码为 0。请回传 `$STRUCTURE_OUT/ablation_report.json`，
 若失败则回传 `structure_summary.log` 和 `summary_exit`。
+
+======
+
+## 从头进行修复后的 Stage B 全量训练
+
+本轮保留原始 HTM pooled/256 策略，建立梯度修复后的训练基线。
+compressor LoRA 和 context seed 重新初始化；predictor 使用 Stage A
+checkpoint-5000 初始化。不会恢复旧 Stage B 或十步短跑权重。
+全部数据、1 epoch、2 GPU、batch=1、累积=8（全局 batch=16），ZeRO-3，
+lr=1e-4、warmup=0.03、λ_pred=0.1。训练 K_r=0。
+
+wrapper 清除 MAX_RECORDS/EXTRA_ARGS 的短跑限制。默认要求新输出目录；
+每 500 步保存，保留最近 3 个 checkpoint，启动配置写入 launch_config.json。
+若有之前确认的坏媒体列表，可在启动前设置 SKIP_LIST_PATH 为其实际路径。
+
+```bash
+conda activate video
+cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
+git fetch origin
+git checkout fix/htm-gradient-diagnostics
+git pull --ff-only
+
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=0,1
+export OUTPUT_DIR="/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_b_fresh_$(date +%Y%m%d_%H%M%S)"
+export HTM_INIT_CHECKPOINT=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_stage_a_2xh100/checkpoint-5000
+export DATASET_ROOT=/mnt/sdb1/wenbin/luoling/LVDU/LLaVA-Video-83K
+export ANNOTATION_PATH=/mnt/sdb1/wenbin/luoling/LLaVA-Video-83K/annotations/all_sampled.json
+
+mkdir -p logs/htm_checks
+TRAIN_LOG="logs/htm_checks/$(basename "$OUTPUT_DIR").log"
+set -o pipefail
+RESUME=0 bash scripts/train/train_htm_stage_b_fresh_2xh100.sh \
+  2>&1 | tee "$TRAIN_LOG"
+TRAIN_EXIT=${PIPESTATUS[0]}
+echo "training_exit=$TRAIN_EXIT"
+echo "output_dir=$OUTPUT_DIR"
+echo "training_log=$TRAIN_LOG"
+```
+
+使用持久终端会话运行长任务。启动日志应显示全部数据（约 83K records），
+global batch=16、从头训练，并成功加载 6 个 Stage A predictor tensors。
+初始若显示 0/10 或仅 64 records，停止检查配置。总优化器步数随有效样本数确定；
+83K single-QA 样本约 5188 步，实际以 Trainer 为准。
+
+先回传启动配置、前 20 个优化器步骤的 loss/grad_norm/显存日志。
+checkpoint-500 生成后，回传保存日志和 launch_config.json，再安排参数更新及评估。
+暂不根据训练 loss 判断 LVBench 效果。
+
+### 中断后恢复这一轮
+
+重新激活环境，进入仓库，并将 OUTPUT_DIR 设置为上次打印的实际目录。
+恢复时不要生成新的时间戳；保持同一训练配置和 GPU 数量。
+
+```bash
+set -o pipefail
+RESUME=1 bash scripts/train/train_htm_stage_b_fresh_2xh100.sh \
+  2>&1 | tee -a "logs/htm_checks/$(basename "$OUTPUT_DIR").log"
+TRAIN_EXIT=${PIPESTATUS[0]}
+echo "training_exit=$TRAIN_EXIT"
+```
+
+恢复日志应显示 resuming from checkpoint-*，而不是 starting from scratch。
