@@ -589,3 +589,91 @@ MODE=full RESUME=1 bash scripts/train/train_htm_stage_b_tokens_2xh100.sh \
 TRAIN_EXIT=${PIPESTATUS[0]}
 echo "training_exit=$TRAIN_EXIT"
 ```
+
+======
+
+## 16-token pilot：checkpoint-25 / checkpoint-50 长训前验收
+
+在训练服务器执行。GPU 推理请在 pilot 结束、GPU 空闲后运行。
+两次推理使用同一份 seed=42 随机抽取的 16 道题，优先不同视频。
+这是 LVBench 独立推理诊断；未核查它与训练集的视频重叠，不能据此声称无泄漏泛化。
+评估不覆盖 checkpoint 配置，以检查保存的 tokens/4096/chronological/grouped 设置。
+
+```bash
+conda activate video
+cd /mnt/data_nvme1/wenbin/luoling/cvpr/code/ours/QVIC-MF-Train
+git pull --ff-only
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export PILOT_DIR=/mnt/sdb1/wenbin/luoling/QVIC-MF-checkpoint/htm_tokens_pilot_20261013_160959
+export FULL_QA=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/lvbench_qa_full.jsonl
+export VIDEO_DIR=/mnt/sdb1/wenbin/luoling/LVDU/eval/LVBench/data/video/all_videos
+export CHECK_OUT="$PILOT_DIR/acceptance_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$CHECK_OUT"
+
+# 此检查仅用 CPU；失败时不要继续 GPU 推理。
+python scripts/tools/check_htm_checkpoint_updates.py \
+  --before "$PILOT_DIR/checkpoint-25" \
+  --after "$PILOT_DIR/checkpoint-50" \
+  --out "$CHECK_OUT/checkpoint_updates.json" || exit $?
+
+python - <<'PY'
+import json, os, random
+from pathlib import Path
+from scripts.tools.check_htm_checkpoint_inference import read_rows, select_rows
+
+pilot = Path(os.environ["PILOT_DIR"])
+expected = {
+    "htm_token_budget": 4096,
+    "htm_event_representation": "tokens",
+    "htm_memory_layout": "chronological",
+    "htm_group_tokens": True,
+    "htm_reset_thresholds_per_video": True,
+}
+for step in (25, 50):
+    config = json.loads((pilot / f"checkpoint-{step}" / "config.json").read_text())
+    for key, value in expected.items():
+        if config.get(key) != value:
+            raise SystemExit(f"checkpoint-{step}: {key}={config.get(key)!r}, expected {value!r}")
+rows = read_rows(Path(os.environ["FULL_QA"]))
+random.Random(42).shuffle(rows)
+selected = select_rows(rows, Path(os.environ["VIDEO_DIR"]), 16)
+subset = Path(os.environ["CHECK_OUT"]) / "questions.jsonl"
+subset.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in selected))
+print("PASS: checkpoint configs; fixed random subset:", [row["key"] for row in selected])
+PY
+CONFIG_EXIT=$?
+if [ "$CONFIG_EXIT" -ne 0 ]; then exit "$CONFIG_EXIT"; fi
+
+export CUDA_VISIBLE_DEVICES=0
+for STEP in 25 50; do
+  python scripts/tools/check_htm_checkpoint_inference.py \
+    --checkpoint "$PILOT_DIR/checkpoint-$STEP" \
+    --questions "$CHECK_OUT/questions.jsonl" \
+    --video-dir "$VIDEO_DIR" \
+    --outdir "$CHECK_OUT/checkpoint-$STEP" \
+    --num-questions 16 --frames 64 --feedback on || exit $?
+done
+
+python - <<'PY'
+import json, os
+from pathlib import Path
+root = Path(os.environ["CHECK_OUT"])
+predictions = {}
+for step in (25, 50):
+    folder = root / f"checkpoint-{step}"
+    report = json.loads((folder / "report.json").read_text())
+    if not report["passed"]:
+        raise SystemExit(f"checkpoint-{step}: inference checks failed")
+    print(f"checkpoint-{step}: {report['score']['correct']}/16; checks={report['checks']}")
+    predictions[step] = {row["key"]: row for row in json.loads((folder / "predictions.json").read_text())}
+if predictions[25].keys() != predictions[50].keys():
+    raise SystemExit("ERROR: question sets differ")
+print("PASS: both reload/inference runs; inspect inference.log HTM telemetry before full training")
+print("Artifacts:", root)
+PY
+```
+
+请回传 checkpoint_updates.json、两份 report.json 和 inference.log 中的 `[HTM τ]` 行。
+参数更新和重载检查通过、没有非有限值或异常记忆坍缩后，可使用上一节的
+MODE=full RESUME=0 命令，从 Stage A predictor 开始新目录全量训练。
+16 题准确率用于诊断，不设必须上涨的门槛，也不作为最终准确率结论。
