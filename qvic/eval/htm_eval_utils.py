@@ -18,7 +18,7 @@ def resolve_htm_model_name(model_path: str, model_base: str | None = None) -> st
     """
     name = get_model_name_from_path(model_path)
     lower = name.lower()
-    if "qvic" in lower or "htm" in lower or "llava" in lower:
+    if "qvic" in lower or "htm" in lower or "easa" in lower or "llava" in lower:
         return name
     if model_base is None:
         return name
@@ -42,6 +42,11 @@ def apply_htm_eval_runtime(
     htm_event_representation: str | None = None,
     htm_memory_layout: str | None = None,
     htm_group_tokens: bool | None = None,
+    use_easa: bool | None = None,
+    easa_lambda: float | None = None,
+    easa_temperature: float | None = None,
+    easa_epsilon: float | None = None,
+    easa_owner_bias: float | None = None,
 ) -> bool:
     """Finish HTM runtime knobs after ``load_pretrained_model``.
 
@@ -52,6 +57,27 @@ def apply_htm_eval_runtime(
     Returns True if HTM write path is active.
     """
     active = bool(getattr(model, "use_htm", False) and getattr(model, "htm_predictor", None) is not None)
+    config = getattr(model, "config", None)
+    # Old callers/checkpoints have no EASA fields and retain their original path.
+    enabled = use_easa if use_easa is not None else getattr(config, "use_easa", False)
+    if enabled and not active:
+        raise ValueError("EASA evaluation requires an HTM checkpoint")
+    if enabled or use_easa is not None or any(x is not None for x in (easa_lambda, easa_temperature, easa_epsilon, easa_owner_bias)):
+        from qvic.model.easa import validate_easa_config
+
+        strength = easa_lambda if easa_lambda is not None else getattr(config, "easa_lambda", 1.0)
+        temperature = easa_temperature if easa_temperature is not None else getattr(config, "easa_temperature", 0.1)
+        epsilon = easa_epsilon if easa_epsilon is not None else getattr(config, "easa_epsilon", 1e-6)
+        owner_bias = easa_owner_bias if easa_owner_bias is not None else getattr(config, "easa_owner_bias", 2.0)
+        validate_easa_config(strength, temperature, epsilon, owner_bias)
+        if enabled and getattr(config, "_attn_implementation", "sdpa") not in ("sdpa", "eager"):
+            raise ValueError("EASA requires decoder attention sdpa or eager")
+        config.use_easa = bool(enabled)
+        config.easa_lambda = float(strength)
+        config.easa_temperature = float(temperature)
+        config.easa_epsilon = float(epsilon)
+        config.easa_owner_bias = float(owner_bias)
+        rank0_print(f"[EASA] eval runtime: enabled={enabled} lambda={strength} temperature={temperature} epsilon={epsilon} owner_bias={owner_bias}")
     if not active:
         rank0_print("[HTM] eval: HTM not active on loaded model (MF / base write path)")
         return False

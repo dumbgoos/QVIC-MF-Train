@@ -24,10 +24,10 @@ from qvic.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DE
 from qvic.utils import rank0_print
 
 
-# #@HTM — Stage A/B ckpt dirs are often named htm_stage_* (no "qvic"/"lora" in the path).
+# HTM/EASA checkpoint names may lack "qvic"/"lora".
 def _name_is_qvic_or_htm(model_name: str) -> bool:
     name = (model_name or "").lower()
-    return "qvic" in name or "htm" in name
+    return "qvic" in name or "htm" in name or "easa" in name
 
 
 # #@HTM
@@ -163,6 +163,12 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
             rank0_print(f'(LoRA) Loading QViC base model from {model_base}')
             is_qwen_base = "qwen" in model_name.lower() or (model_base is not None and "qwen" in model_base.lower())
+            if getattr(cfg_pretrained, "use_easa", False):
+                from qvic.model.easa import validate_easa_config
+
+                validate_easa_config(getattr(cfg_pretrained, "easa_lambda", 1.0), getattr(cfg_pretrained, "easa_temperature", 0.1), getattr(cfg_pretrained, "easa_epsilon", 1e-6), getattr(cfg_pretrained, "easa_owner_bias", 2.0))
+                if not is_qwen_base or attn_implementation not in ("sdpa", "eager"):
+                    raise ValueError("EASA checkpoints require the Qwen2 decoder with sdpa or eager attention")
             if is_qwen_base:
                 # [BUG?] correct vocab_size
                 # ref. https://github.com/LLaVA-VL/LLaVA-NeXT/issues/329

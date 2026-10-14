@@ -46,6 +46,7 @@ from qvic.utils import rank0_print, rank_print
 
 # #@HTM
 from qvic.model.htm import HTMMemoryController, HTMPredictor
+from qvic.model.easa import add_assignment_newlines, align_decoder_assignments
 
 
 class QViCMetaMixin:
@@ -113,6 +114,8 @@ class QViCMetaMixin:
         self.htm_pred_loss = None
         self.htm_recent_window = 4
         self.htm_pred_weight = 0.1  # #@HTM Stage B default λ on L_pred
+        self.memory_event_assignments = None
+        self._easa_assignments = None
         self.htm_lambda_lm = 0.0  # Stage A: optimize L_pred only by default
 
     @abstractmethod
@@ -365,6 +368,12 @@ class QViCMetaMixin:
         all_image = all([x == "image" for x in modalities])
         assert all_video or all_image, "Mixed modalities are not supported yet. (QViC)"
 
+        easa_enabled = bool(getattr(self.config, "use_easa", False))
+        context_assignments = None
+        self._easa_assignments = None
+        if easa_enabled and (not all_video or not self.use_htm):
+            raise ValueError("Decoder EASA requires HTM video memory")
+
         with torch.inference_mode((not self.training) or self.train_qvic_freeze_encoder):
 
             if all_video:
@@ -374,11 +383,15 @@ class QViCMetaMixin:
                     delete_cache = (not self.training) or self.train_qvic_freeze_encoder
                     self.embed_video_streaming(images, image_sizes, input_ids_q, disable_tqdm=disable_tqdm, delete_tmp_tensor=delete_cache)
                     context_embeds = self.prepare_contexts_for_streaming()  # B x [L, ctx, D]
+                    if easa_enabled:
+                        context_assignments = self.memory_event_assignments
                     if delete_cache:
                         self.clear_memory()
                 else:
                     # assume that the context memory is already constructed in another thread
                     context_embeds = self.prepare_contexts_for_streaming()  # B x [L, ctx, D]
+                    if easa_enabled:
+                        context_assignments = self.memory_event_assignments
             else:
                 # image modalities (debug)
                 if type(images) is not list and images.dim() == 6:  # Video format [B, Nf=1, Np, C, H, W]
@@ -401,6 +414,8 @@ class QViCMetaMixin:
                 context_embeds = self.get_context_embeds_from_encoder_outputs(encoder_outputs)
                 context_embeds = context_embeds.unsqueeze(1)  # B x [L=1, ctx, D]
 
+        if easa_enabled and context_assignments is None:
+            raise RuntimeError("EASA event memberships missing from HTM memory")
         # insert image_newline token to context_embeds
         if context_embeds is not None:
             mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
@@ -436,6 +451,19 @@ class QViCMetaMixin:
         (_, position_ids__, attention_mask__, past_key_values__, inputs_embeds__, labels__) = self.prepare_inputs_for_decoder(
             input_ids, position_ids, attention_mask, past_key_values, labels, context_embeds)
 
+        if easa_enabled:
+            # Clone outside inference_mode: backward through a frozen decoder
+            # still needs to save its mask when QA trains the compressor.
+            memberships = [add_assignment_newlines(
+                p, mm_newline_position, mm_patch_merge_type,
+                faster_video=getattr(self.config, "add_faster_video", False),
+            ).clone() for p in context_assignments]
+            if any(p.shape[0] != c.shape[0] for p, c in zip(memberships, context_embeds)):
+                raise RuntimeError("EASA memberships and decoder memory lengths differ")
+            self._easa_assignments = align_decoder_assignments(
+                input_ids, attention_mask, memberships, inputs_embeds__.shape[1],
+                IMAGE_TOKEN_INDEX, getattr(self.config, "tokenizer_padding_side", "right"),
+            )
         return None, position_ids__, attention_mask__, past_key_values__, inputs_embeds__, labels__
 
     def prepare_inputs_for_decoder(
@@ -952,6 +980,10 @@ class QViCMetaMixin:
                                     self._htm_pred_loss_sum = self._htm_pred_loss_sum + step_loss
                                     self._htm_pred_steps = int(self._htm_pred_steps) + 1
                         self.context_memory = self.htm_controller.materialize_context_memory(ctx_for_htm)
+                        if getattr(self.config, "use_easa", False):
+                            self.memory_event_assignments = self.htm_controller.materialize_event_assignments(
+                                ctx_for_htm, temperature=getattr(self.config, "easa_temperature", 0.1),
+                                owner_bias=getattr(self.config, "easa_owner_bias", 2.0))
                         # Snapshot before prepare_inputs clear_memory (needed for HTM_EVAL_LOG_TAU).
                         try:
                             self._htm_last_eval_stats = self.htm_controller.snapshot_eval_write_stats(0)
@@ -1183,6 +1215,8 @@ class QViCMetaMixin:
                 del self.reflection_frequency
             self.reflection_frequency = None
         # #@HTM — drop event/recent token buffers so consecutive long videos do not retain peak VRAM
+        self.memory_event_assignments = None
+        self._easa_assignments = None
         if getattr(self, "htm_controller", None) is not None:
             self.htm_controller.states = []
         self.htm_pred_loss = None

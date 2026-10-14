@@ -39,7 +39,7 @@ export RUN_NAME="${RUN_NAME:-$(basename "$OUTPUT_DIR")}"
 if [[ "$REPORT_TO" = wandb ]]; then
     export WANDB_PROJECT="${WANDB_PROJECT:-qvic-htm-stage-b}"
 fi
-export EXTRA_ARGS="--htm_token_budget 4096 --htm_event_representation tokens --htm_memory_layout chronological --htm_group_tokens True --htm_reset_thresholds_per_video True"
+export EXTRA_ARGS="--htm_token_budget 4096 --htm_event_representation tokens --htm_memory_layout chronological --htm_group_tokens True --htm_reset_thresholds_per_video True ${EXTRA_ARGS:-}"
 if [[ "$MODE" = pilot ]]; then
     export MAX_RECORDS=128 GRAD_ACCUM=4 SAVE_STEPS=25 SAVE_TOTAL_LIMIT=4 LOGGING_STEPS=5
     export EXTRA_ARGS="$EXTRA_ARGS --max_steps 100"

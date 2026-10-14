@@ -75,6 +75,7 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
         dpo_forward: Optional[bool] = False,
         cache_position=None,
         input_ids_q: Optional[torch.LongTensor] = None,  # questions for context encoder
+        easa_assignments: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if (inputs_embeds is None) and (input_ids_q is not None):  # training
@@ -82,6 +83,8 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
             (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) \
                 = self.prepare_inputs_labels_for_qvic(
                     input_ids, attention_mask, position_ids, past_key_values, labels, images, image_sizes, modalities, input_ids_q)
+
+            easa_assignments = self._easa_assignments
 
         if dpo_forward:
             outputs = self.model(
@@ -94,6 +97,7 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                easa_assignments=easa_assignments,
             )
 
             hidden_states = outputs[0]
@@ -111,7 +115,8 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                return_dict=return_dict
+                return_dict=return_dict,
+                easa_assignments=easa_assignments,
             )
             # #@HTM — Stage A: L_pred (+ optional λ_lm * L_LM); Stage B: L_LM + λ L_pred
             if self.training and getattr(self, "use_htm", False):
@@ -167,12 +172,21 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
             else:
                 inputs_embeds = self.get_model().embed_tokens(inputs)
 
+        if getattr(self.config, "use_easa", False):
+            if images is None and not self.has_memory_constructed:
+                raise ValueError("EASA generation requires video memory")
+            if input_ids_q is None and not self.has_memory_constructed:
+                raise ValueError("EASA generation requires input_ids_q for HTM event discovery")
+            if self._easa_assignments is None:
+                raise RuntimeError("EASA generation has no aligned event memberships")
+            kwargs["easa_assignments"] = self._easa_assignments
         return super().generate(position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
         image_sizes = kwargs.pop("image_sizes", None)
         input_ids_q = kwargs.pop("input_ids_q", None)
+        easa_assignments = kwargs.pop("easa_assignments", None)
         modalities = kwargs.pop("modalities", None)
         inputs = super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs)
         if images is not None:
@@ -183,6 +197,8 @@ class LlavaQwenForCausalLM(LlavaMetaForCausalLM, Qwen2ForCausalLM):
             inputs["modalities"] = modalities
         if input_ids_q is not None:
             inputs['input_ids_q'] = input_ids_q
+        if easa_assignments is not None:
+            inputs["easa_assignments"] = easa_assignments
         return inputs
 
 

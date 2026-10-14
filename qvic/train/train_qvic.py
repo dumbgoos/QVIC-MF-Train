@@ -80,6 +80,12 @@ class ModelArguments:
         },
     )
 
+    use_easa: bool = field(default=False, metadata={"help": "HTM event prior on decoder visual-memory self-attention."})
+    easa_lambda: float = field(default=1.0, metadata={"help": "Strength of lambda * log(P P^T + epsilon)."})
+    easa_temperature: float = field(default=0.1, metadata={"help": "Cosine-softmax event membership temperature."})
+    easa_epsilon: float = field(default=1e-6)
+    easa_owner_bias: float = field(default=2.0, metadata={"help": "Finite soft-assignment logit prior for the actual HTM event owner; 0 disables it."})
+
     # --- attention kernels ---
     attn_implementation: str = field(default="sdpa", metadata={"help": "Decoder attention: sdpa | eager | flash_attention_2"})
     encoder_attn_implementation: str = field(
@@ -248,6 +254,14 @@ def silence_qvic_logging() -> None:
 
 
 def build_model(model_args: ModelArguments, training_args: QViCTrainingArguments):
+    from qvic.model.easa import validate_easa_config
+
+    validate_easa_config(model_args.easa_lambda, model_args.easa_temperature, model_args.easa_epsilon, model_args.easa_owner_bias)
+    if model_args.use_easa:
+        if not (model_args.use_htm or model_args.htm_stage_a):
+            raise ValueError("--use_easa requires HTM (--use_htm)")
+        if model_args.attn_implementation not in ("sdpa", "eager"):
+            raise ValueError("EASA requires --attn_implementation sdpa or eager")
     compute_dtype = (torch.bfloat16 if training_args.bf16 else
                      (torch.float16 if training_args.fp16 else torch.float32))
     zero3 = is_deepspeed_zero3_enabled()
@@ -257,6 +271,11 @@ def build_model(model_args: ModelArguments, training_args: QViCTrainingArguments
     config.vocab_size = 152064
     config.tokenizer_model_max_length = training_args.model_max_length
     config.use_cache = False
+    config.use_easa = bool(model_args.use_easa)
+    config.easa_lambda = float(model_args.easa_lambda)
+    config.easa_temperature = float(model_args.easa_temperature)
+    config.easa_epsilon = float(model_args.easa_epsilon)
+    config.easa_owner_bias = float(model_args.easa_owner_bias)
     # QViC fields -- these get written to config.json and read back by
     # `initialize_context_embed` / `embed_video_streaming` at load time.
     config.context_embed_tokens = model_args.context_embed_tokens

@@ -45,6 +45,7 @@ from transformers.utils import (
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
 from qvic.utils import rank0_print, rank_print
+from qvic.model.easa import apply_easa_attention_mask
 
 # === QViC: Question-guided Mask Selective Attention (QMSA) hook (Fujitsu, CC BY-NC-SA 4.0) ===
 # All QMSA math (paper eq.9, eq.10) lives in `qvic.model.qmsa`; this module only
@@ -1023,6 +1024,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         token_ranges=None,
+        easa_assignments=None,
         **kwargs
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1079,6 +1081,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
                 )
 
+        if easa_assignments is not None and self._attn_implementation == "flash_attention_2":
+            raise ValueError("EASA requires decoder attention sdpa or eager")
         if self._attn_implementation == "flash_attention_2":
             # 2d mask is passed through the layers
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
@@ -1099,6 +1103,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 inputs_embeds,
                 past_key_values_length,
                 sliding_window=self.config.sliding_window,
+            )
+
+        if easa_assignments is not None:
+            attention_mask = apply_easa_attention_mask(
+                attention_mask, easa_assignments,
+                query_length=seq_length, key_length=past_key_values_length + seq_length,
+                past_length=past_key_values_length, dtype=inputs_embeds.dtype, device=inputs_embeds.device,
+                strength=getattr(self.config, "easa_lambda", 1.0), epsilon=getattr(self.config, "easa_epsilon", 1e-6),
             )
 
         hidden_states = inputs_embeds

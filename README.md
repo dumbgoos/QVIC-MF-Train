@@ -138,6 +138,13 @@ Re-running the same command resumes from the newest `checkpoint-*`. One epoch is
 wall clock; [`scripts/cluster/`](scripts/cluster) has batch-scheduler
 wrappers that add automatic resume and tolerance for decoder crashes.
 
+## Event-Aware Selective Attention (EASA)
+
+Optional EASA uses HTM event memberships to add `lambda * log(P P^T + epsilon)`
+to decoder visual-memory self-attention. It is disabled by default and supports
+Qwen2 `sdpa`/`eager` training and inference. See
+[implementation, launch commands and validation](scripts/tools/EASA.md).
+
 ## Licence
 
 CC-BY-NC-SA-4.0, inherited from the upstream release. See [`LICENSE`](LICENSE)

@@ -60,6 +60,11 @@ def main() -> int:
     parser.add_argument("--memory-layout", choices=("legacy", "chronological", "frames"), default=None)
     parser.add_argument("--group-tokens", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--quantile", type=float, default=0.9)
+    parser.add_argument("--easa", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--easa-lambda", type=float, default=None)
+    parser.add_argument("--easa-temperature", type=float, default=None)
+    parser.add_argument("--easa-epsilon", type=float, default=None)
+    parser.add_argument("--easa-owner-bias", type=float, default=None)
     parser.add_argument("--prepare-only", action="store_true", help="Validate paths and write input/command without loading the model")
     args = parser.parse_args()
     if min(args.num_questions, args.frames) <= 0 or (args.memory_tokens is not None and args.memory_tokens <= 0) or not 0 <= args.quantile <= 1:
@@ -74,6 +79,11 @@ def main() -> int:
         args.event_representation = args.event_representation or config.get("htm_event_representation", "pooled")
         args.memory_layout = args.memory_layout or config.get("htm_memory_layout", "legacy")
         args.group_tokens = args.group_tokens if args.group_tokens is not None else config.get("htm_group_tokens", False)
+        args.easa = args.easa if args.easa is not None else config.get("use_easa", False)
+        args.easa_lambda = args.easa_lambda if args.easa_lambda is not None else config.get("easa_lambda", 1.0)
+        args.easa_temperature = args.easa_temperature if args.easa_temperature is not None else config.get("easa_temperature", 0.1)
+        args.easa_epsilon = args.easa_epsilon if args.easa_epsilon is not None else config.get("easa_epsilon", 1e-6)
+        args.easa_owner_bias = args.easa_owner_bias if args.easa_owner_bias is not None else config.get("easa_owner_bias", 2.0)
         selected = select_rows(read_rows(args.questions), args.video_dir, args.num_questions)
         artifacts = ("questions.jsonl", "predictions.json", "inference.log", "report.json", "command.json")
         if any((args.outdir / name).exists() for name in artifacts):
@@ -94,6 +104,9 @@ def main() -> int:
                    "--context_condition_frame_num", "32", "--compress_with_relevance", str(args.feedback == "on"),
                    "--htm_stage_a", "False", "--htm_quantile", str(args.quantile),
                    "--torch_dtype", "bfloat16", "--set_verbose", "False"]
+        command.extend(["--use_easa", str(args.easa), "--easa_lambda", str(args.easa_lambda),
+                        "--easa_temperature", str(args.easa_temperature), "--easa_epsilon", str(args.easa_epsilon),
+                        "--easa_owner_bias", str(args.easa_owner_bias)])
         (args.outdir / "command.json").write_text(json.dumps(command, indent=2) + "\n")
         print(f"Selected {len(selected)} questions: {[row['key'] for row in selected]}", flush=True)
         if args.prepare_only:
@@ -127,6 +140,7 @@ def main() -> int:
             "requested_event_representation_active": f"event_representation={args.event_representation}" in log_text,
             "requested_memory_layout_active": f"memory_layout={args.memory_layout}" in log_text,
             "requested_decoder_grouping_active": f"grouped={args.group_tokens}" in log_text,
+            "requested_easa_active": f"[EASA] eval runtime: enabled={args.easa} " in log_text,
             "all_selected_questions_predicted_once": len(actual) == len(expected) and set(actual) == set(expected),
             "nonempty_valid_predictions": bool(predictions) and all(str(r.get("pred", "")).strip() and scorer.normalize_letter(r.get("pred")) in "ABCD" for r in predictions),
             "ground_truth_matches_subset": all(r.get("gt") == expected.get(r.get("key"), {}).get("answer") for r in predictions),
@@ -136,6 +150,9 @@ def main() -> int:
                   "event_representation": args.event_representation, "relevance_memory_entries": 256,
                   "memory_layout": args.memory_layout,
                   "group_tokens": args.group_tokens,
+                  "use_easa": args.easa, "easa_lambda": args.easa_lambda,
+                  "easa_temperature": args.easa_temperature, "easa_epsilon": args.easa_epsilon,
+                  "easa_owner_bias": args.easa_owner_bias,
                   "frames": args.frames, "memory_tokens": args.memory_tokens, "exit_code": exit_code,
                   "checks": checks, "passed": all(checks.values()),
                   "score": scorer.score(predictions), "note": "Loading/inference smoke only; tiny uniformly sampled subset cannot measure accuracy recovery."}

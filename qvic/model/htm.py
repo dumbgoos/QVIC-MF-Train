@@ -334,8 +334,8 @@ class HTMMemoryController:
             return event.tokens
         return event.z.unsqueeze(0)
 
-    def build_memory_tokens(self, state: HTMSampleState) -> torch.Tensor:
-        """Flat readable memory ``[T, D]``, with event cost 1 or C, ``T ≤ L``."""
+    def _select_memory_units(self, state: HTMSampleState) -> List[Dict]:
+        """Select units once with the same eviction/order policy for values and metadata."""
         units: List[Dict] = []
         # Recent raw clips (each costs C).
         for i, clip in enumerate(state.recent):
@@ -384,11 +384,18 @@ class HTMMemoryController:
                 units.pop(drop_idx)
 
         if not units:
-            return torch.zeros(0, 0)
+            return []
         if self.memory_layout in ("chronological", "frames"):
             # Sort only after eviction so chronological ablation preserves the
             # same selected units, including overlap with recent raw frames.
             units.sort(key=lambda u: u["time"])
+        return units
+
+    def build_memory_tokens(self, state: HTMSampleState) -> torch.Tensor:
+        """Flat readable memory ``[T, D]``, with event cost 1 or C, ``T ≤ L``."""
+        units = self._select_memory_units(state)
+        if not units:
+            return torch.zeros(0, 0)
         tokens = torch.cat([u["tokens"] for u in units], dim=0)  # [T, D]
         if tokens.shape[0] > self.L:
             tokens = tokens[: self.L]
@@ -447,3 +454,41 @@ class HTMMemoryController:
                 raise ValueError("Frame baseline needs a budget large enough for whole C-token frames")
             out = out.reshape(B, T // C, C, D)
         return out
+
+    @torch.no_grad()
+    def materialize_event_assignments(self, reference: torch.Tensor, temperature: float = 0.1, owner_bias: float = 2.0) -> torch.Tensor:
+        """Membership aligned exactly with materialized memory [B, groups, C, E].
+
+        Use every discovered event (including the open event) as a prototype.
+        Each retained unit gets one membership vector repeated over its tokens;
+        this preserves the temporal observation granularity even for token events.
+        """
+        from qvic.model.easa import soft_event_assignments
+
+        lengths, per = [], []
+        for state in self.states:
+            units = self._select_memory_units(state)
+            events = state.events + ([state.open_event] if state.open_event is not None else [])
+            if not units or not events:
+                raise RuntimeError("EASA requires a populated HTM stream")
+            prototypes = torch.stack([ev.z.detach() for ev in events])
+            observations = torch.stack([u["tokens"].detach().mean(dim=0) for u in units])
+            owners = []
+            for unit in units:
+                start, end, _ = unit["time"]
+                owner = next((i for i, ev in enumerate(events) if ev.t_s <= start and end <= ev.t_e), None)
+                if owner is None:
+                    raise RuntimeError("Retained HTM memory unit has no event owner")
+                owners.append(owner)
+            P = soft_event_assignments(observations, prototypes, temperature,
+                                       owners=torch.tensor(owners, device=observations.device), owner_bias=owner_bias)
+            counts = torch.tensor([u["cost"] for u in units], device=P.device)
+            P = P.repeat_interleave(counts, dim=0)[:self.L]
+            per.append(P)
+            lengths.append(P.shape[0])
+        T, E = max(lengths), max(p.shape[1] for p in per)
+        out = torch.zeros(len(per), T, E, device=reference.device, dtype=torch.float32)
+        for b, P in enumerate(per):
+            out[b, :P.shape[0], :P.shape[1]] = P.to(reference.device)
+        C = reference.shape[-2] if self.memory_layout == "frames" or self.group_tokens else 1
+        return out.reshape(len(per), T // C, C, E)

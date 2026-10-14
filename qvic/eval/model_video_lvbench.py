@@ -107,6 +107,11 @@ def parse_args():
     parser.add_argument("--htm_event_representation", choices=("pooled", "tokens"), default=None)
     parser.add_argument("--htm_memory_layout", choices=("legacy", "chronological", "frames"), default=None)
     parser.add_argument("--htm_group_tokens", type=lambda x: str(x).lower() == 'true', default=None)
+    parser.add_argument("--use_easa", type=lambda x: str(x).lower() == 'true', default=None)
+    parser.add_argument("--easa_lambda", type=float, default=None)
+    parser.add_argument("--easa_temperature", type=float, default=None)
+    parser.add_argument("--easa_epsilon", type=float, default=None)
+    parser.add_argument("--easa_owner_bias", type=float, default=None)
     
     return parser.parse_args()
 
@@ -190,6 +195,11 @@ def run_inference(args):
         htm_event_representation=args.htm_event_representation,
         htm_memory_layout=args.htm_memory_layout,
         htm_group_tokens=args.htm_group_tokens,
+        use_easa=args.use_easa,
+        easa_lambda=args.easa_lambda,
+        easa_temperature=args.easa_temperature,
+        easa_epsilon=args.easa_epsilon,
+        easa_owner_bias=args.easa_owner_bias,
     )
 
     if '.jsonl' in args.question_fp:
