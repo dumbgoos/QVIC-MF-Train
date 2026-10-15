@@ -85,6 +85,84 @@ the prior after training is an inference ablation, not joint EASA training.
 
 ## Validation and limits
 
+### Four-H100 local-path launcher
+
+`scripts/train/train_easa_htm_4xh100.sh` is an independent launcher, so it avoids
+the hard-coded two-GPU settings in the older wrapper. It defaults to a full
+epoch, GPUs `4,5,6,7`, per-GPU batch 1 and accumulation 8 (global batch 32).
+`BATCH_SIZE=2` automatically uses accumulation 4. The learning rate stays
+`1e-4`; saving every 250 updates and logging every 5 updates approximately
+preserve the old batch-16 recipe's sample-based frequencies. Pilot mode also
+uses global batch 32, with 128 records / 100 updates.
+
+Default server paths:
+
+| Input | Path |
+| --- | --- |
+| Media and shard index | `/data/jwb/data/Prot/ProteinAnn` |
+| Annotations | `/data/jwb/data/ProteinAnn/annotations/all_sampled.json` |
+| Base model | `/data/jwb/ckpt/LLaVA-Video-7B-Qwen2` |
+| Vision encoder | `/data/jwb/ckpt/siglip-so400m-patch14-384` |
+| Stage A run | `/data/jwb/ckpt/htm_stage_a_2xh100` |
+| Bad-media list | `/data2/jwb/QVIC-MF-Train/bad_media.json` |
+
+The Stage A run root resolves to its own `non_lora_trainables.bin` if present,
+otherwise `checkpoint-5000`, otherwise the highest numbered checkpoint with
+that file. The resolved path is printed and recorded. Override
+`HTM_INIT_CHECKPOINT` to select a specific checkpoint explicitly.
+
+Local vision weights are selected through `--vision_tower`, overriding
+`mm_vision_tower` before constructing the model; this value is also saved in
+the checkpoint config. The vision factory checks SigLIP names before the
+generic existing-directory CLIP fallback. Offline mode is on by default.
+
+```bash
+conda activate video
+cd /data2/jwb/QVIC-MF-Train
+
+# Preview only; does not check server files, create outputs or start training.
+CUDA_VISIBLE_DEVICES=4,5,6,7 DRY_RUN=1 \
+  bash scripts/train/train_easa_htm_4xh100.sh
+
+# New pilot, no W&B reporting.
+CUDA_VISIBLE_DEVICES=4,5,6,7 MODE=pilot REPORT_TO=none \
+  bash scripts/train/train_easa_htm_4xh100.sh
+
+# New full epoch, also reported to W&B.
+CUDA_VISIBLE_DEVICES=4,5,6,7 MODE=full REPORT_TO=wandb \
+  bash scripts/train/train_easa_htm_4xh100.sh
+
+# Resume this launcher's run, keeping its original mode and batch settings.
+CUDA_VISIBLE_DEVICES=4,5,6,7 MODE=full RESUME=1 \
+OUTPUT_DIR=/data/jwb/ckpt/ACTUAL_EASA_RUN_DIRECTORY \
+  bash scripts/train/train_easa_htm_4xh100.sh
+```
+
+Do not pre-create a fresh `OUTPUT_DIR`. The launcher creates it and writes
+`train.log` internally. Use a new output directory for pilot versus full runs;
+an inherited `OUTPUT_DIR`/`RUN_NAME` can be cleared with `unset OUTPUT_DIR RUN_NAME`.
+It validates inputs before training, uses master port 29528, records the full
+command plus skip-list SHA-256, and rejects resumes with changed data, batch,
+model or recipe settings. It does not resume old two-GPU launcher runs.
+Logging backend and run name may change on resume. Do not change the bad-media
+list mid-run when exact data-order continuation matters.
+
+Full mode defaults to `REPORT_TO=wandb` and project `qvic-easa-htm`;
+pilot defaults to `REPORT_TO=none`. Run `wandb login` in the training environment first, and set
+`WANDB_MODE=online` to override a previously inherited offline setting. A
+previously exported `REPORT_TO=none` still takes precedence over the default;
+the full-training command above explicitly enables W&B. `WANDB_ENTITY` can select an account
+or team, and `RUN_NAME` controls the displayed run name.
+
+The media directory must include `metadata/shard_index.parquet`; merely having
+the index under the annotation directory is insufficient for the current
+ShardReader. W&B authentication is separate from offline model loading.
+Run `python scripts/tools/test_easa_4gpu_launcher.py` for temporary-directory
+tests with a fake torchrun (no model/GPU execution), including local SigLIP
+dispatch, path wiring, checkpoint selection, batch derivation and resume guards.
+
+### Controller and decoder tests
+
 ```bash
 python scripts/tools/test_easa.py
 python scripts/tools/test_easa_decoder.py

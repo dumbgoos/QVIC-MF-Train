@@ -32,6 +32,7 @@ class ModelArguments:
         default="lmms-lab/LLaVA-Video-7B-Qwen2",
         metadata={"help": "Base LMM. Both the decoder and the visual compressor start from it."},
     )
+    vision_tower: Optional[str] = field(default=None, metadata={"help": "Override the base config's vision tower, e.g. a local SigLIP directory."})
 
     # --- QViC architecture (mirrors Table 1 / Table 2 of the supplementary) ---
     context_embed_tokens: int = field(default=16, metadata={"help": "Context tokens C per frame."})
@@ -267,6 +268,8 @@ def build_model(model_args: ModelArguments, training_args: QViCTrainingArguments
     zero3 = is_deepspeed_zero3_enabled()
 
     config = LlavaQwenConfig.from_pretrained(model_args.model_base, cache_dir=training_args.cache_dir)
+    if model_args.vision_tower:
+        config.mm_vision_tower = model_args.vision_tower
     # Same vocab fix the inference builder applies (LLaVA-NeXT issue #329).
     config.vocab_size = 152064
     config.tokenizer_model_max_length = training_args.model_max_length
