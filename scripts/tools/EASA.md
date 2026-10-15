@@ -161,6 +161,36 @@ Run `python scripts/tools/test_easa_4gpu_launcher.py` for temporary-directory
 tests with a fake torchrun (no model/GPU execution), including local SigLIP
 dispatch, path wiring, checkpoint selection, batch derivation and resume guards.
 
+### GPU-0 pretrained training smoke
+
+```bash
+conda activate video
+cd /data2/jwb/QVIC-MF-Train
+unset OUTPUT_DIR RUN_NAME
+DRY_RUN=1 bash scripts/train/test_easa_htm_gpu0.sh
+bash scripts/train/test_easa_htm_gpu0.sh
+```
+
+This wrapper forces physical GPU 0, one process, microbatch/accumulation 1,
+16 annotation records and four optimizer updates. It keeps the full recipe's
+64 frames, C=16, 4096-token grouped HTM memory, EASA, LoRA, BF16, SDPA and ZeRO-3.
+It uses the same local data/model/Stage A/skip-list paths as the four-GPU launcher,
+with default port 29529, a separate `easa_htm_smoke_gpu0_*` output directory and
+no W&B reporting. It does not resume or touch the full training output.
+
+The wrapper requires checkpoints at steps 2 and 4, finite logged training
+losses, saved EASA/HTM configuration, and stored parameter updates in compressor
+LoRA, context seed and predictor between those checkpoints. Any training or
+postflight failure returns nonzero. Read `train.log` and
+`smoke_parameter_updates.json` in its output directory. No accuracy threshold
+or loss-decrease requirement is imposed on a four-step smoke.
+
+A single GPU holds more model state than each rank of a four-GPU ZeRO-3 job;
+single-GPU OOM therefore does not establish that four-GPU training cannot fit.
+This smoke does not test checkpoint reload, distributed execution or accuracy.
+Local launcher tests simulate GPU execution only; run this command on the H100
+server to validate actual pretrained forward/backward and checkpoint writing.
+
 ### Controller and decoder tests
 
 ```bash

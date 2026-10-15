@@ -99,8 +99,63 @@ def main():
         assert run(DRY_RUN="1", CUDA_VISIBLE_DEVICES="4,5").returncode != 0
         assert run(DRY_RUN="1", CUDA_VISIBLE_DEVICES="4,5,6,6").returncode != 0
         assert run(OUTPUT_DIR=str(tmp / "missing-file"), SKIP_LIST_PATH=str(tmp / "absent")).returncode != 0
+        smoke = tmp / "smoke-run"
+        result = run(MODE="smoke", OUTPUT_DIR=str(smoke), BATCH_SIZE="2", REPORT_TO="wandb")
+        assert result.returncode == 0, result.stdout + result.stderr
+        launch = json.loads((smoke / "launch_config.json").read_text())
+        args = launch["signature"]
+        assert launch["cuda_visible_devices"] == "0" and "--nproc_per_node=1" in launch["command"]
+        assert args["--per_device_train_batch_size"] == args["--gradient_accumulation_steps"] == "1"
+        assert args["--max_records"] == "16" and args["--max_steps"] == "4" and args["--save_steps"] == "2"
+        assert args["--logging_nan_inf_filter"] == "False"
+        assert "--report_to none" in result.stdout
+
+        # Exercise the smoke wrapper's actual postflight with simulated torchrun
+        # output; it must fail on missing/invalid results, not print a false PASS.
+        fake = tmp / "fake-smoke-python.py"
+        fake.write_text('''import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args[:2] == ["-m", "torch.distributed.run"]:
+    if os.environ.get("FAKE_TRAIN_FAIL"):
+        raise SystemExit(7)
+    out = Path(os.environ["OUTPUT_DIR"])
+    for step in (2, 4):
+        path = out / f"checkpoint-{step}"
+        path.mkdir()
+        config = {"use_easa": True, "htm_token_budget": 4096, "htm_event_representation": "tokens", "htm_group_tokens": True}
+        (path / "config.json").write_text(json.dumps(config))
+        for name in ("adapter_config.json", "adapter_model.bin", "non_lora_trainables.bin"):
+            (path / name).touch()
+        loss = float("nan") if os.environ.get("FAKE_BAD_LOSS") else 1.0
+        (path / "trainer_state.json").write_text(json.dumps({"global_step": step, "log_history": [{"loss": loss}]}))
+elif args and args[0].endswith("check_htm_checkpoint_updates.py"):
+    Path(os.environ["CAPTURE_COMPARISON"]).write_text(json.dumps(args))
+    raise SystemExit(int(os.environ.get("FAKE_COMPARE_FAIL", 0)))
+''')
+        shim.write_text("#!/bin/bash\nif [[ \"${1:-}\" = -m && \"${2:-}\" = torch.distributed.run ]] || "
+                        "[[ \"${1:-}\" = *check_htm_checkpoint_updates.py ]]; then\n"
+                        f"  exec {shlex.quote(sys.executable)} {shlex.quote(str(fake))} \"$@\"\nfi\n"
+                        f"exec {shlex.quote(sys.executable)} \"$@\"\n")
+        wrapper = ROOT / "scripts/train/test_easa_htm_gpu0.sh"
+
+        def run_wrapper(name, **overrides):
+            return subprocess.run(["bash", str(wrapper)], env={**env, "OUTPUT_DIR": str(tmp / name),
+                                  "CAPTURE_COMPARISON": str(tmp / "comparison.json"), **overrides}, text=True, capture_output=True)
+
+        result = run_wrapper("wrapper-success")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "PASS: GPU-0 EASA + HTM training smoke" in result.stdout
+        comparison = json.loads((tmp / "comparison.json").read_text())
+        assert any(value.endswith("checkpoint-2") for value in comparison) and any(value.endswith("checkpoint-4") for value in comparison)
+        assert run_wrapper("wrapper-failed-training", FAKE_TRAIN_FAIL="1").returncode == 7
+        assert run_wrapper("wrapper-bad-loss", FAKE_BAD_LOSS="1").returncode != 0
+        assert run_wrapper("wrapper-failed-updates", FAKE_COMPARE_FAIL="1").returncode != 0
+        dry_wrapper = tmp / "wrapper-dry"
+        assert run_wrapper(dry_wrapper.name, DRY_RUN="1").returncode == 0 and not dry_wrapper.exists()
     print("PASS local SigLIP dispatch, four-GPU batch=32 commands, Stage A selection, full/pilot and local paths")
     print("PASS fresh/resume guards, skip-list hash, dry-run isolation and invalid GPU/batch rejection")
+    print("PASS GPU-0 smoke isolation, checkpoint/loss validation, update comparison and failure propagation (simulated training)")
 
 
 if __name__ == "__main__":

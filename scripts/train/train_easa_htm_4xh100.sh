@@ -1,6 +1,7 @@
 #!/bin/bash
 # Joint EASA + HTM Stage B, four H100s, effective global batch fixed at 32.
 # Full epoch by default. MODE=pilot uses 128 records / 100 updates, also batch 32.
+# MODE=smoke is used by the GPU-0 wrapper: one GPU / batch 1 / four updates.
 # DRY_RUN=1 prints the command without creating directories or loading models.
 set -euo pipefail
 QVIC_ROOT="${QVIC_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -8,38 +9,44 @@ cd "$QVIC_ROOT"
 PYTHON="${QVIC_PY:-python}"
 MODE="${MODE:-full}"
 RESUME="${RESUME:-0}"
-if [[ "$MODE" != full && "$MODE" != pilot ]]; then
-    echo "ERROR: MODE must be full or pilot" >&2; exit 2
+if [[ "$MODE" != full && "$MODE" != pilot && "$MODE" != smoke ]]; then
+    echo "ERROR: MODE must be full, pilot or smoke" >&2; exit 2
 fi
 if [[ "$RESUME" != 0 && "$RESUME" != 1 ]]; then
     echo "ERROR: RESUME must be 0 or 1" >&2; exit 2
 fi
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
-IFS=',' read -r -a DEVICES <<< "$CUDA_VISIBLE_DEVICES"
-if [[ ${#DEVICES[@]} != 4 ]]; then
-    echo "ERROR: exactly four CUDA_VISIBLE_DEVICES are required" >&2; exit 2
-fi
-for ((i=0; i<4; i++)); do
-    if [[ ! "${DEVICES[i]}" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: use four distinct numeric GPU IDs" >&2; exit 2
+if [[ "$MODE" = smoke ]]; then
+    # Explicitly isolate the requested physical GPU, ignoring an inherited list.
+    export CUDA_VISIBLE_DEVICES=0
+    NUM_GPUS=1 GLOBAL_BATCH_SIZE=1 BATCH_SIZE=1 GRAD_ACCUM=1
+else
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+    IFS=',' read -r -a DEVICES <<< "$CUDA_VISIBLE_DEVICES"
+    if [[ ${#DEVICES[@]} != 4 ]]; then
+        echo "ERROR: exactly four CUDA_VISIBLE_DEVICES are required" >&2; exit 2
     fi
-    for ((j=0; j<i; j++)); do
-        if [[ "${DEVICES[i]}" = "${DEVICES[j]}" ]]; then
-            echo "ERROR: duplicate GPU ID" >&2; exit 2
+    for ((i=0; i<4; i++)); do
+        if [[ ! "${DEVICES[i]}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: use four distinct numeric GPU IDs" >&2; exit 2
         fi
+        for ((j=0; j<i; j++)); do
+            if [[ "${DEVICES[i]}" = "${DEVICES[j]}" ]]; then
+                echo "ERROR: duplicate GPU ID" >&2; exit 2
+            fi
+        done
     done
-done
-NUM_GPUS=4
-GLOBAL_BATCH_SIZE=32
-BATCH_SIZE="${BATCH_SIZE:-1}"
-if [[ ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || ((BATCH_SIZE > 8)); then
-    echo "ERROR: BATCH_SIZE must be a positive divisor of 8" >&2; exit 2
+    NUM_GPUS=4
+    GLOBAL_BATCH_SIZE=32
+    BATCH_SIZE="${BATCH_SIZE:-1}"
+    if [[ ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || ((BATCH_SIZE > 8)); then
+        echo "ERROR: BATCH_SIZE must be a positive divisor of 8" >&2; exit 2
+    fi
+    if (( GLOBAL_BATCH_SIZE % (NUM_GPUS * BATCH_SIZE) )); then
+        echo "ERROR: 4 * BATCH_SIZE must divide global batch 32" >&2; exit 2
+    fi
+    # Derived rather than inherited: BATCH_SIZE=2 automatically changes accumulation to 4.
+    GRAD_ACCUM=$(( GLOBAL_BATCH_SIZE / NUM_GPUS / BATCH_SIZE ))
 fi
-if (( GLOBAL_BATCH_SIZE % (NUM_GPUS * BATCH_SIZE) )); then
-    echo "ERROR: 4 * BATCH_SIZE must divide global batch 32" >&2; exit 2
-fi
-# Derived rather than inherited: BATCH_SIZE=2 automatically changes accumulation to 4.
-GRAD_ACCUM=$(( GLOBAL_BATCH_SIZE / NUM_GPUS / BATCH_SIZE ))
 MASTER_PORT="${MASTER_PORT:-29528}"
 DATASET_ROOT="${DATASET_ROOT:-/data/jwb/data/Prot/ProteinAnn}"
 ANNOTATION_ROOT="${ANNOTATION_ROOT:-/data/jwb/data/ProteinAnn}"
@@ -57,7 +64,10 @@ EASA_TEMPERATURE="${EASA_TEMPERATURE:-0.1}"
 EASA_EPSILON="${EASA_EPSILON:-1e-6}"
 EASA_OWNER_BIAS="${EASA_OWNER_BIAS:-2.0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-if [[ "$MODE" = full ]]; then
+if [[ "$MODE" = smoke ]]; then
+    REPORT_TO=none SAVE_STEPS=2 LOGGING_STEPS=1 SAVE_TOTAL_LIMIT=2
+    NUM_WORKERS=1
+elif [[ "$MODE" = full ]]; then
     REPORT_TO="${REPORT_TO:-wandb}"
     SAVE_STEPS="${SAVE_STEPS:-250}"
     LOGGING_STEPS="${LOGGING_STEPS:-5}"
@@ -142,8 +152,12 @@ CMD=("$PYTHON" -m torch.distributed.run --nproc_per_node="$NUM_GPUS" --master_po
     --save_total_limit "$SAVE_TOTAL_LIMIT" --report_to "$REPORT_TO")
 if [[ "$RESUME" = 0 ]]; then CMD+=(--htm_init_checkpoint "$HTM_INIT_CHECKPOINT"); fi
 if [[ "$MODE" = pilot ]]; then CMD+=(--max_records 128 --max_steps 100); fi
+if [[ "$MODE" = smoke ]]; then CMD+=(--max_records 16 --max_steps 4 --logging_nan_inf_filter False); fi
 echo "EASA + HTM: mode=$MODE resume=$RESUME devices=$CUDA_VISIBLE_DEVICES port=$MASTER_PORT"
-echo "global batch=$NUM_GPUS * $BATCH_SIZE * $GRAD_ACCUM = $GLOBAL_BATCH_SIZE; lr=$LR; 1 epoch"
+TRAINING_LENGTH="1 epoch"
+if [[ "$MODE" = pilot ]]; then TRAINING_LENGTH="100 optimizer steps"; fi
+if [[ "$MODE" = smoke ]]; then TRAINING_LENGTH="4 optimizer steps"; fi
+echo "global batch=$NUM_GPUS * $BATCH_SIZE * $GRAD_ACCUM = $GLOBAL_BATCH_SIZE; lr=$LR; $TRAINING_LENGTH"
 echo "Stage A=$HTM_INIT_CHECKPOINT (run roots resolve to checkpoint-5000, or latest available)"
 echo "output=$OUTPUT_DIR; report_to=$REPORT_TO; run_name=$RUN_NAME"
 if [[ "$REPORT_TO" = wandb ]]; then
