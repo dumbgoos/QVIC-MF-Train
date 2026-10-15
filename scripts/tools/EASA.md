@@ -161,6 +161,37 @@ Run `python scripts/tools/test_easa_4gpu_launcher.py` for temporary-directory
 tests with a fake torchrun (no model/GPU execution), including local SigLIP
 dispatch, path wiring, checkpoint selection, batch derivation and resume guards.
 
+### GPU-0 full-epoch training
+
+`scripts/train/train_easa_htm_gpu0.sh` runs the full EASA + HTM recipe on
+physical GPU 0 with microbatch 1, accumulation 32 and effective batch 32.
+It explicitly selects full mode with no record/step limit, keeps 64 frames,
+all model/memory/optimizer settings and server paths, reports to W&B by
+default, uses port 29530 and writes to a new `easa_htm_gpu0_full_*` directory.
+It starts from Stage A predictor weights with fresh compressor LoRA/context
+seeds; it does not continue the four-step smoke checkpoint.
+
+```bash
+conda activate proteinnovo
+cd /data2/jwb/QVIC-MF-Train
+unset OUTPUT_DIR RUN_NAME
+DRY_RUN=1 bash scripts/train/train_easa_htm_gpu0.sh
+REPORT_TO=wandb WANDB_MODE=online bash scripts/train/train_easa_htm_gpu0.sh
+
+# Resume this same single-GPU run, using its actual output path:
+RESUME=1 OUTPUT_DIR=/data/jwb/ckpt/ACTUAL_GPU0_FULL_RUN \
+REPORT_TO=wandb WANDB_MODE=online bash scripts/train/train_easa_htm_gpu0.sh
+```
+
+Keep the working proxy environment from the successful W&B connectivity test.
+Saving remains every 250 optimizer updates, logging every 5, and training is
+one epoch (approximately 2593 updates for the 82,991-sample filtered corpus).
+Each optimizer step processes 32 microbatches on one GPU, so the interval
+between progress updates is much longer than the four-step batch-1 smoke.
+`LOGGING_STEPS=1` can make full-training metric updates more frequent, but
+cannot shorten a single optimizer step. Gradient accumulation does not keep
+all 32 microbatch forward graphs alive simultaneously.
+
 ### GPU-0 pretrained training smoke
 
 ```bash

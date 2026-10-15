@@ -2,6 +2,7 @@
 # Joint EASA + HTM Stage B, four H100s, effective global batch fixed at 32.
 # Full epoch by default. MODE=pilot uses 128 records / 100 updates, also batch 32.
 # MODE=smoke is used by the GPU-0 wrapper: one GPU / batch 1 / four updates.
+# TRAINING_NUM_GPUS=1 is used by the separate full-training GPU-0 wrapper.
 # DRY_RUN=1 prints the command without creating directories or loading models.
 set -euo pipefail
 QVIC_ROOT="${QVIC_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -20,14 +21,21 @@ if [[ "$MODE" = smoke ]]; then
     export CUDA_VISIBLE_DEVICES=0
     NUM_GPUS=1 GLOBAL_BATCH_SIZE=1 BATCH_SIZE=1 GRAD_ACCUM=1
 else
-    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
-    IFS=',' read -r -a DEVICES <<< "$CUDA_VISIBLE_DEVICES"
-    if [[ ${#DEVICES[@]} != 4 ]]; then
-        echo "ERROR: exactly four CUDA_VISIBLE_DEVICES are required" >&2; exit 2
+    NUM_GPUS="${TRAINING_NUM_GPUS:-4}"
+    if [[ "$NUM_GPUS" = 1 ]]; then
+        export CUDA_VISIBLE_DEVICES=0
+    elif [[ "$NUM_GPUS" = 4 ]]; then
+        export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+    else
+        echo "ERROR: TRAINING_NUM_GPUS must be 1 or 4" >&2; exit 2
     fi
-    for ((i=0; i<4; i++)); do
+    IFS=',' read -r -a DEVICES <<< "$CUDA_VISIBLE_DEVICES"
+    if [[ ${#DEVICES[@]} != "$NUM_GPUS" ]]; then
+        echo "ERROR: exactly $NUM_GPUS CUDA_VISIBLE_DEVICES are required" >&2; exit 2
+    fi
+    for ((i=0; i<NUM_GPUS; i++)); do
         if [[ ! "${DEVICES[i]}" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: use four distinct numeric GPU IDs" >&2; exit 2
+            echo "ERROR: use distinct numeric GPU IDs" >&2; exit 2
         fi
         for ((j=0; j<i; j++)); do
             if [[ "${DEVICES[i]}" = "${DEVICES[j]}" ]]; then
@@ -35,14 +43,14 @@ else
             fi
         done
     done
-    NUM_GPUS=4
     GLOBAL_BATCH_SIZE=32
     BATCH_SIZE="${BATCH_SIZE:-1}"
-    if [[ ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || ((BATCH_SIZE > 8)); then
-        echo "ERROR: BATCH_SIZE must be a positive divisor of 8" >&2; exit 2
+    MAX_MICRO_BATCH=$(( GLOBAL_BATCH_SIZE / NUM_GPUS ))
+    if [[ ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || ((BATCH_SIZE > MAX_MICRO_BATCH)); then
+        echo "ERROR: BATCH_SIZE must be a positive divisor of $MAX_MICRO_BATCH" >&2; exit 2
     fi
     if (( GLOBAL_BATCH_SIZE % (NUM_GPUS * BATCH_SIZE) )); then
-        echo "ERROR: 4 * BATCH_SIZE must divide global batch 32" >&2; exit 2
+        echo "ERROR: NUM_GPUS * BATCH_SIZE must divide global batch 32" >&2; exit 2
     fi
     # Derived rather than inherited: BATCH_SIZE=2 automatically changes accumulation to 4.
     GRAD_ACCUM=$(( GLOBAL_BATCH_SIZE / NUM_GPUS / BATCH_SIZE ))
@@ -81,6 +89,7 @@ fi
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
 export PYTHONPATH="$QVIC_ROOT:${PYTHONPATH:-}"
 if [[ "$REPORT_TO" = wandb ]]; then
     export WANDB_PROJECT="${WANDB_PROJECT:-qvic-easa-htm}"
@@ -168,6 +177,7 @@ if [[ "${DRY_RUN:-0}" = 1 ]]; then echo "DRY RUN: no files written, training not
 
 # Store the exact command, data exclusion hash and semantic arguments. A resume
 # must keep the data, model and training recipe; logging destinations may change.
+echo "[launch] Recording configuration and checking resume compatibility"
 "$PYTHON" - "$OUTPUT_DIR" "$RESUME" "$MODE" "$SKIP_LIST_PATH" "$CUDA_VISIBLE_DEVICES" "${CMD[@]}" <<'PY'
 import hashlib, json, os, subprocess, sys
 from pathlib import Path
@@ -191,6 +201,7 @@ record = dict(mode=mode, command=command, signature=signature, cuda_visible_devi
 target = Path(out) / ("resume_config.json" if resume == "1" else "launch_config.json")
 target.write_text(json.dumps(record, indent=2) + "\n")
 PY
+echo "[launch] Starting torchrun on $NUM_GPUS GPU(s); training log: $OUTPUT_DIR/train.log"
 set +e
 "${CMD[@]}" 2>&1 | tee -a "$OUTPUT_DIR/train.log"
 RESULTS=("${PIPESTATUS[@]}")

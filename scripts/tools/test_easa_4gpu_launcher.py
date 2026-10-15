@@ -57,6 +57,7 @@ def main():
         shim.chmod(0o755)
         env = os.environ.copy()
         env.update(QVIC_ROOT=str(ROOT), QVIC_PY=str(shim), CUDA_VISIBLE_DEVICES="4,5,6,7", BATCH_SIZE="1",
+                   TRAINING_NUM_GPUS="4",
                    DATASET_ROOT=str(media), ANNOTATION_ROOT=str(annotation),
                    ANNOTATION_PATH=str(annotation / "annotations/all_sampled.json"),
                    MODEL_BASE=str(base), VISION_TOWER=str(vision), HTM_INIT_CHECKPOINT=str(stage_a),
@@ -99,6 +100,22 @@ def main():
         assert run(DRY_RUN="1", CUDA_VISIBLE_DEVICES="4,5").returncode != 0
         assert run(DRY_RUN="1", CUDA_VISIBLE_DEVICES="4,5,6,6").returncode != 0
         assert run(OUTPUT_DIR=str(tmp / "missing-file"), SKIP_LIST_PATH=str(tmp / "absent")).returncode != 0
+        single_wrapper = ROOT / "scripts/train/train_easa_htm_gpu0.sh"
+        single_out = tmp / "single-full"
+        single_env = {**env, "OUTPUT_DIR": str(single_out), "BATCH_SIZE": "2", "MODE": "pilot", "TRAINING_NUM_GPUS": "4"}
+        result = subprocess.run(["bash", str(single_wrapper)], env=single_env, text=True, capture_output=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        single = json.loads((single_out / "launch_config.json").read_text())
+        args = single["signature"]
+        assert single["mode"] == "full" and single["cuda_visible_devices"] == "0"
+        assert "--nproc_per_node=1" in single["command"] and "--master_port=29530" in single["command"]
+        assert args["--per_device_train_batch_size"] == "1" and args["--gradient_accumulation_steps"] == "32"
+        assert args["--num_train_epochs"] == "1" and "--max_steps" not in args and "--max_records" not in args
+        assert args["--use_easa"] == args["--use_htm"] == "True"
+        assert args["--save_steps"] == "250" and args["--logging_steps"] == "5"
+        (single_out / "checkpoint-250").mkdir()
+        result = subprocess.run(["bash", str(single_wrapper)], env={**single_env, "RESUME": "1"}, text=True, capture_output=True)
+        assert result.returncode == 0, result.stdout + result.stderr
         smoke = tmp / "smoke-run"
         result = run(MODE="smoke", OUTPUT_DIR=str(smoke), BATCH_SIZE="2", REPORT_TO="wandb")
         assert result.returncode == 0, result.stdout + result.stderr
@@ -156,6 +173,7 @@ elif args and args[0].endswith("check_htm_checkpoint_updates.py"):
     print("PASS local SigLIP dispatch, four-GPU batch=32 commands, Stage A selection, full/pilot and local paths")
     print("PASS fresh/resume guards, skip-list hash, dry-run isolation and invalid GPU/batch rejection")
     print("PASS GPU-0 smoke isolation, checkpoint/loss validation, update comparison and failure propagation (simulated training)")
+    print("PASS GPU-0 full-epoch wrapper, batch=32, override isolation and resume (simulated training)")
 
 
 if __name__ == "__main__":
