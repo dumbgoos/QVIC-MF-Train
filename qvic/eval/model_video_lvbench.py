@@ -218,8 +218,14 @@ def run_inference(args):
         input_ids = None
         output_ids = None
 
-        filename_prefix = q_dict['key'][:11] # "Cm73ma6Ibcs_55" -> "Cm73ma6Ibcs"
-        video_path = os.path.join(args.video_dir, f"{filename_prefix}.mp4")
+        # MLVU / generic: prefer explicit relative or absolute video path.
+        # LVBench: fall back to YouTube id = key[:11].
+        if q_dict.get("video"):
+            v = q_dict["video"]
+            video_path = v if os.path.isabs(v) else os.path.join(args.video_dir, v)
+        else:
+            filename_prefix = q_dict["key"][:11]
+            video_path = os.path.join(args.video_dir, f"{filename_prefix}.mp4")
 
         # Check if the video exists
         if os.path.exists(video_path):
@@ -235,7 +241,15 @@ def run_inference(args):
             print(f"Video file {video_path} does not exist. Skipping this video.")
             continue
 
-        question0 = q_dict['question']
+        question0 = q_dict["question"]
+        # If options already baked into question (formatter), keep as-is.
+        # If candidates/options present, expand like official MLVU qa_template.
+        cands = q_dict.get("candidates") or q_dict.get("options")
+        if cands and "Options:" not in question0 and "\nA." not in question0:
+            lines = [f"Question: {question0}", "Options:"]
+            for i, c in enumerate(cands):
+                lines.append(f"({chr(ord('A') + i)}) {c}")
+            question0 = "\n".join(lines)
         question = f"{question0}\nAnswer with the option's letter from the given choices directly."
         # Process prompt.
         qs = question
